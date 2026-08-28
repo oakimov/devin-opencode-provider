@@ -2,6 +2,8 @@ import * as crypto from "node:crypto"
 import * as zlib from "node:zlib"
 import { concat, encodeMessage, encodeString, encodeVarintField, frameEnvelope, iterFields, parseConnectFrames } from "./wire.js"
 import { buildMetadata } from "./metadata.js"
+import { trace } from "../debug.js"
+import { DevinProviderError } from "../errors.js"
 
 export type ContentPart =
   | { type: "text"; text: string }
@@ -325,22 +327,30 @@ export async function* streamChatEvents(req: {
     triggerId: crypto.randomUUID(),
   })
   const body = frameConnectStream(proto, true)
-  const resp = await fetch(`${host}/exa.api_server_pb.ApiServerService/GetChatMessage`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/connect+proto",
-      "Connect-Protocol-Version": "1",
-      "Connect-Content-Encoding": "gzip",
-      "Connect-Accept-Encoding": "gzip",
-    },
-    body: body as unknown as BodyInit,
-    signal: req.signal,
-  })
+  let resp: Response
+  try {
+    resp = await fetch(`${host}/exa.api_server_pb.ApiServerService/GetChatMessage`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/connect+proto",
+        "Connect-Protocol-Version": "1",
+        "Connect-Content-Encoding": "gzip",
+        "Connect-Accept-Encoding": "gzip",
+      },
+      body: body as unknown as BodyInit,
+      signal: req.signal,
+    })
+  } catch (e) {
+    trace(`GetChatMessage fetch failed: ${(e as Error).message} host=${host} model=${req.modelUid}`)
+    throw e
+  }
   if (!resp.ok) {
     const text = await resp.text().catch(() => "")
-    throw new CloudChatError(`GetChatMessage HTTP ${resp.status}: ${text.slice(0, 400)}`, String(resp.status))
+    const snippet = text.slice(0, 800)
+    trace(`GetChatMessage failed HTTP ${resp.status}: ${snippet} host=${host} model=${req.modelUid} msgs=${req.messages.length} tools=${req.tools?.length ?? 0}`)
+    throw new CloudChatError(`GetChatMessage HTTP ${resp.status}: ${snippet.slice(0, 400)}`, String(resp.status))
   }
-  if (!resp.body) throw new CloudChatError("No body stream")
+  if (!resp.body) { trace(`GetChatMessage no body stream host=${host} model=${req.modelUid}`); throw new CloudChatError("No body stream") }
   const reader = resp.body.getReader() as ReadableStreamDefaultReader<Uint8Array>
   let queued: Uint8Array[] = []
   let queuedBytes = 0
@@ -384,7 +394,7 @@ export async function* streamChatEvents(req: {
       drop(len)
       let payload = raw
       if (flags & 0x01) {
-        try { payload = zlib.gunzipSync(raw as Buffer) } catch (e) { throw new CloudChatError(`gunzip failed: ${(e as Error).message}`) }
+        try { payload = zlib.gunzipSync(raw as Buffer) } catch (e) { trace(`GetChatMessage gunzip failed: ${(e as Error).message}`); throw new CloudChatError(`gunzip failed: ${(e as Error).message}`) }
       }
       const eos = (flags & 0x02) !== 0
       if (eos) {
@@ -401,8 +411,17 @@ export async function* streamChatEvents(req: {
       yield* decodeChatFrame(payload)
     }
   }
-  if (trailerError) throw new CloudChatError(trailerError.message, trailerError.code)
+  if (trailerError) {
+    trace(`GetChatMessage trailer error code=${trailerError.code ?? ""} message=${trailerError.message.slice(0, 800)} host=${host} model=${req.modelUid}`)
+    // Surface quota errors as non-transient so OpenCode shows message instead of retrying as "overloaded"
+    const isQuota = trailerError.code === "failed_precondition" && /quota has been exhausted/i.test(trailerError.message)
+    if (isQuota) {
+      throw new DevinProviderError(trailerError.message, { code: trailerError.code, transient: false, replaySafe: false })
+    }
+    throw new CloudChatError(trailerError.message, trailerError.code)
+  }
   if (!sawEos) {
     // tolerate missing EOS for some mocks
+    trace(`GetChatMessage missing EOS host=${host} model=${req.modelUid} sawEos=${sawEos}`)
   }
 }

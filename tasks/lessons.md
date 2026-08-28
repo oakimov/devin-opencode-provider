@@ -22,3 +22,6 @@ This directory contains development notes and lessons learned during development
 ### Metadata
 - Must match golden capture format (1.48.2, 3.6.27, mac, Free)
 - Paths: bff, editor, cli, server, agent
+
+### Agent tooling
+- Keep `oldString` minimal but unique (2-3 lines with indentation) to avoid ambiguous matches.

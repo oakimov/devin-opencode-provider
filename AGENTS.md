@@ -1,6 +1,8 @@
-# Agent Configuration (AGENTS.md)
+# devin-opencode-provider
 
-This file configures the agent behavior for this provider. It is used by OpenCode and compatible coding agents to understand how to work with this provider.
+OpenCode plugin + AI SDK provider that runs Devin subscription models by speaking Devin's Connect-RPC Cascade protocol (`server.codeium.com`, not a generic chat-completions API). Mirrors `cursor-opencode-provider` structure for OpenCode.
+
+**Stack:** TypeScript (ESM), Bun for install/test, `tsc` for build. Optional peer: `@opencode-ai/plugin@^1.17.13` (devDependency pinned to `^1.18.16`). Deps: `@ai-sdk/provider@3.0.15`. Devin/Windsurf backend: Connect-RPC `GetCascadeModelConfigs` / `GetUserStatus` / `GetUserJwt` / `GetChatMessage` at `https://server.codeium.com`.
 
 ## Provider behavior
 
