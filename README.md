@@ -91,7 +91,7 @@ Choose the **devin** provider, then one of:
 | **Devin account (browser login)** | PKCE OAuth — opens devin.ai to sign in |
 | **API key** | Paste a key from [devin.ai/settings](https://devin.ai/settings) |
 
-After login, the plugin fetches your available models and writes them to `<host-cache>/devin-models.json`. On later startups, a missing, empty, or expired cache is refreshed during config load when Devin auth is available.
+After login, the plugin fetches your available models and writes them to `<host-cache>/devin-models.json`. On later startups, a missing, empty, or expired cache is refreshed during config load when Devin auth is available. `DEVIN_API_KEY` is also picked up automatically for auth without `/connect`.
 
 ### Paths (host cache)
 
@@ -122,6 +122,7 @@ import { createDevin } from "devin-opencode-provider"
 const devin = createDevin({
   name: "devin",
   accessToken: process.env.DEVIN_ACCESS_TOKEN,
+  apiKey: process.env.DEVIN_API_KEY,
   // apiBaseURL: "https://api.devin.ai",
   // cacheDir: "/path/to/host/cache",
 })
@@ -130,12 +131,14 @@ const model = devin.languageModel("swe-1-6-slow")
 // model implements AI SDK LanguageModelV3 (doStream / doGenerate)
 ```
 
-Pass either `accessToken` (JWT from OAuth or key exchange) or `apiKey` (raw key). Optional: `apiBaseURL`, `cacheDir`, `headers`.
+Pass either `accessToken` (JWT from OAuth or key exchange) or `apiKey` (raw key). Optional: `apiBaseURL`, `cacheDir`, `headers`, `workspaceRoot`. You can also set `DEVIN_API_KEY` as an environment variable instead of passing `apiKey`.
 
 ## Environment variables
 
 | Variable | Description |
 |----------|-------------|
+| `DEVIN_API_KEY` | Devin API key (sk-ws-01-..., cog_..., or devin-session-token$...) for auth without `/connect` |
+| `WINDSURF_API_KEY` | Alias for DEVIN_API_KEY (for Windsurf compatibility) |
 | `DEVIN_API_BASE_URL` | Override API base URL (default `https://api.devin.ai`) |
 | `XDG_CACHE_HOME` | Base for host cache dirs (`$XDG_CACHE_HOME/opencode/`) |
 | `XDG_DATA_HOME` | When set, OpenCode `auth.json` is read from `$XDG_DATA_HOME/opencode/` instead of `~/.local/share/opencode/` |

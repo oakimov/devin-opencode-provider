@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["devin-opencode-provider"],
+  "provider": {
+    "devin": {
+      "npm": "devin-opencode-provider",
+      "name": "Devin",
+      "models": {}
+    }
+  }
+}

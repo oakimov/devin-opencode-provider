@@ -23,3 +23,7 @@ export function isDevinPackage(pkg: string, providerID: string): boolean {
 export function devinApiBaseURL(): string {
   return process.env.DEVIN_API_BASE_URL ?? process.env.WINDSURF_API_BASE_URL ?? `https://${WINDSURF_API_HOST}`
 }
+
+export function devinApiKey(): string | undefined {
+  return process.env.DEVIN_API_KEY ?? process.env.WINDSURF_API_KEY
+}
