@@ -140,8 +140,10 @@ Pass either `accessToken` (JWT from OAuth or key exchange) or `apiKey` (raw key)
 | `DEVIN_API_KEY` | Devin API key (sk-ws-01-..., cog_..., or devin-session-token$...) for auth without `/connect` |
 | `WINDSURF_API_KEY` | Alias for DEVIN_API_KEY (for Windsurf compatibility) |
 | `DEVIN_API_BASE_URL` | Override API base URL (default `https://api.devin.ai`) |
+| `DEVIN_PROVIDER_DEBUG` | Set to `1` or `true` to enable wire-level debug logging |
+| `DEVIN_PROVIDER_DEBUG_FILE` | Override debug log path (default: `$TMPDIR/devin-provider-logs-<uid>/debug-<pid>.log`) |
 | `XDG_CACHE_HOME` | Base for host cache dirs (`$XDG_CACHE_HOME/opencode/`) |
-| `XDG_DATA_HOME` | When set, OpenCode `auth.json` is read from `$XDG_DATA_HOME/opencode/` instead of `~/.local/share/opencode/` |
+| > `XDG_DATA_HOME` | When set, OpenCode `auth.json` is read from `$XDG_DATA_HOME/opencode/` instead of `~/.local/share/opencode/` |
 
 ## Development
 
