@@ -80,11 +80,12 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
       cfg.provider ??= {}
       const models = await loadModels()
       for (const pid of [DEVIN_PROVIDER_ID, WINDSURF_PROVIDER_ID]) {
-        const existing = (cfg.provider as Record<string, unknown>)[pid] as { models?: Record<string, unknown> } | undefined
+        const existing = (cfg.provider as Record<string, unknown>)[pid] as
+          | { models?: Record<string, unknown>; name?: string; npm?: string }
+          | undefined
         if (existing) {
-          if (!existing.models || Object.keys(existing.models).length === 0) {
-            ;(existing as any).models = models
-          }
+          // Always refresh — otherwise a stale first load keeps old flat/unsorted variants.
+          ;(existing as { models: Record<string, unknown> }).models = models
           continue
         }
         // Only install primary on first run; keep windsurf alias minimal

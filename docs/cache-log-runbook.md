@@ -20,13 +20,11 @@
 Enable wire-level debug logging:
 
 ```bash
-export CURSOR_PROVIDER_DEBUG=1
+export DEVIN_PROVIDER_DEBUG=1
 # or
-export CURSOR_PROVIDER_DEBUG=1
-export CURSOR_PROVIDER_DEBUG_FILE=/path/to/debug.log
+export DEVIN_PROVIDER_DEBUG=1
+export DEVIN_PROVIDER_DEBUG_FILE=/path/to/debug.log
 ```
-
-Note: Currently uses `CURSOR_PROVIDER_DEBUG` for compatibility with cursor-opencode-provider. May change to `DEVIN_PROVIDER_DEBUG` in future.
 
 ## Cache troubleshooting
 

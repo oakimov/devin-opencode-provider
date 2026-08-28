@@ -22,8 +22,16 @@ OpenCode plugin + AI SDK provider that runs Devin subscription models by speakin
 
 ## Model variants
 
-Devin models may expose parameterized variants (effort, thinking, context tier). These are materialized as OpenCode model variants.
+Devin exposes **flat** `model_uid`s. We group them **display-name-first** into one OpenCode base id with **parameter-only** variants (`devinVariantParameters`). Variants must not carry a second model id. At request time, `language-model.ts` resolves the wire uid via alias table (opaque `MODEL_PRIVATE_*`) or `wireModelIdFromBaseAndParams`.
 
+- **Effort / speed**: `Low`, `Low Fast`, `Medium`, …, `Max`, `Max Fast` (Fast after same effort).
+- **SWE Lightning**: all non-Lightning first, then Lightning — `Medium`, `Max`, `Lightning Medium`, `Lightning Max`.
+- **Thinking**: redundant “Thinking” labels stripped when the whole ladder is thinking-mode; keep explicit `No Thinking`.
+- **Context tier**: `-1m` stays a **separate base** (`claude-opus-4-6` vs `claude-opus-4-6-1m`), not a Max Mode flag.
+- **Reasoning**: `reasoning: true` if any group member supports thinking or exposes thinking/effort variants.
+- **Plugin**: always overwrites `cfg.provider.devin.models` on config load (do not keep a stale first merge).
+
+There is **no Cursor-style Max Mode** toggle; **Max** = high effort only.
 ## Cache behavior
 
 - Model list cached under `<host-cache>/devin-models.json`

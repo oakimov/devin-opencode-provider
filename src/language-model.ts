@@ -6,6 +6,14 @@ import { trace } from "./debug.js"
 import type { ChatHistoryItem, ToolDef } from "./protocol/chat.js"
 import { streamChatEvents } from "./protocol/chat.js"
 import { buildLanguageModelV3UsageFromCounters, emptyLanguageModelV3Usage, type DevinUsageCounters } from "./usage.js"
+import { remapDevinEditForApplyPatchCatalog } from "./protocol/apply-patch-bridge.js"
+import { extractDevinVariantParameters, resolveDevinWireModelId } from "./models.js"
+import { resolveDevinModelSupportsImages } from "./model-metadata.js"
+import {
+  assertDevinUserImageSupport,
+  extractDevinPromptImages,
+  hasDevinUserImages,
+} from "./image-input.js"
 
 function extractSystemPrompt(prompt: LanguageModelV3CallOptions["prompt"]): string | undefined {
   const sys = prompt.filter(m => m.role === "system").map(m => {
@@ -155,7 +163,7 @@ export function buildDevinOpenCodeGuidance(tools: ToolDef[], workspaceRoot: stri
     )
   } else if (names.has("apply_patch")) {
     instructions.push(
-      "- Use OpenCode `apply_patch` for file-content changes; do not use shell, Python, or heredocs to change file content while it is available.",
+      "- Use OpenCode `apply_patch` for file-content changes; do not use shell, Python, or heredocs to change file content while it is available. Devin-native write and edit requests are accepted and converted to `apply_patch` automatically.",
     )
   }
 
@@ -228,6 +236,71 @@ async function doStreamImpl(
   const host = options.apiBaseURL ?? devinApiBaseURL()
   const userJwt = await getCachedUserJwt(apiKey, host, callOptions.abortSignal ?? undefined)
 
+  // Resolve wire model id + variant params mirroring cursor's doStream:
+  // OpenCode merges model/variant into providerOptions.devin — we must not
+  // leak unrelated options onto the wire.
+  const rawProviderOptions = (callOptions as unknown as { providerOptions?: unknown }).providerOptions as
+    | Record<string, unknown>
+    | undefined
+  let devinOpts: Record<string, unknown> | undefined
+  if (rawProviderOptions) {
+    const maybeNested = (rawProviderOptions as Record<string, unknown>).devin
+    if (maybeNested && typeof maybeNested === "object" && !Array.isArray(maybeNested)) {
+      devinOpts = maybeNested as Record<string, unknown>
+    } else if (
+      typeof rawProviderOptions["devinModelId"] === "string" ||
+      Object.hasOwn(rawProviderOptions, "devinVariantParameters")
+    ) {
+      devinOpts = rawProviderOptions as Record<string, unknown>
+    }
+  }
+  const picked = (() => {
+    try {
+      return extractDevinVariantParameters(devinOpts)
+    } catch (e) {
+      trace(`devin variant params malformed: ${(e as Error).message}`)
+      return undefined
+    }
+  })()
+  // OpenCode id is the base (`claude-opus-5`); Devin wire uid is synthesized
+  // from variant params (`claude-opus-5-medium`). Matches Cursor's one-id shape.
+  const wireModelId = resolveDevinWireModelId(devinOpts, modelId, picked)
+  if (picked || wireModelId !== modelId) {
+    trace(`devin variant: opencodeId=${modelId} wireId=${wireModelId} picked=${picked ? JSON.stringify(picked) : "none"}`)
+  }
+
+  // Image support check mirrors cursor/src/language-model.ts:948-982
+  const lastUserRaw = [...callOptions.prompt].reverse().find((m) => (m as any).role === "user") as unknown as
+    | Record<string, unknown>
+    | undefined
+  const supportsImages = resolveDevinModelSupportsImages(wireModelId, undefined)
+  if (lastUserRaw) {
+    assertDevinUserImageSupport(lastUserRaw, supportsImages, wireModelId)
+    if (!supportsImages && hasDevinUserImages(lastUserRaw)) {
+      trace(`image input: dropping user images for model=${wireModelId} (no support)`)
+    }
+  }
+  let imageExtraction: Awaited<ReturnType<typeof extractDevinPromptImages>> | undefined
+  try {
+    imageExtraction = await extractDevinPromptImages(
+      callOptions.prompt as readonly unknown[],
+      lastUserRaw,
+      { supportsImages, signal: callOptions.abortSignal as AbortSignal | undefined },
+    )
+    if (!supportsImages && imageExtraction.candidateCount > 0) {
+      trace(`image input: dropped ${imageExtraction.candidateCount} history image(s); model=${wireModelId} does not support images`)
+    }
+    if (imageExtraction.duplicateCount > 0) {
+      trace(`image input: skipped ${imageExtraction.duplicateCount} duplicate history image(s)`)
+    }
+    if (imageExtraction.images.length > 0) {
+      trace(`image input: ${imageExtraction.userImageCount} user + ${imageExtraction.images.length - imageExtraction.userImageCount} history image(s) for ${wireModelId} totalBytes=${imageExtraction.images.reduce((n: number, i: { data: Uint8Array }) => n + i.data.length, 0)}`)
+    }
+  } catch (e) {
+    // Gating errors (unsupported) surface as provider errors
+    throw e
+  }
+
   const systemPrompt = extractSystemPrompt(callOptions.prompt)
   let messages = extractHistory(callOptions.prompt)
   const tools = extractTools(callOptions)
@@ -241,7 +314,7 @@ async function doStreamImpl(
     messages = [{ role: "system", content: systemPrompt }, ...messages]
   }
 
-  trace(`devin doStream model=${modelId} host=${host} msgs=${messages.length} tools=${tools.length} toolNames=${tools.map(t => t.name).join(",")}`)
+  trace(`devin doStream model=${modelId} wire=${wireModelId} host=${host} msgs=${messages.length} tools=${tools.length} toolNames=${tools.map(t => t.name).join(",")}`)
 
   const stream = new ReadableStream<LanguageModelV3StreamPart>({
     async start(controller) {
@@ -257,7 +330,7 @@ async function doStreamImpl(
       const toFinishReason = (unified: string, raw?: string): any => ({ unified, raw })
 
       try {
-        for await (const ev of streamChatEvents({ apiKey, apiServerUrl: host, modelUid: modelId, messages, tools: tools.length ? tools : undefined, signal: callOptions.abortSignal, userJwt })) {
+        for await (const ev of streamChatEvents({ apiKey, apiServerUrl: host, modelUid: wireModelId, messages, tools: tools.length ? tools : undefined, signal: callOptions.abortSignal, userJwt })) {
           if (callOptions.abortSignal?.aborted) break
           if (ev.kind === "text") {
             if (!textId) {
@@ -324,12 +397,64 @@ async function doStreamImpl(
 
       if (textId) controller.enqueue({ type: "text-end", id: textId } as LanguageModelV3StreamPart)
       if (reasoningId) controller.enqueue({ type: "reasoning-end", id: reasoningId } as LanguageModelV3StreamPart)
-      for (const tc of toolCalls.values()) {
-        let parsed: unknown = tc.args
-        try { parsed = JSON.parse(tc.args) } catch {}
-        const input = typeof parsed === "string" ? parsed : JSON.stringify(parsed)
-        controller.enqueue({ type: "tool-call", toolCallId: tc.id, toolName: tc.name, input } as unknown as LanguageModelV3StreamPart)
+      // For GPT models where OpenCode swaps edit/write for apply_patch (see
+      // src/protocol/apply-patch.ts header / opencode PR #9127), translate Devin's
+      // native write/edit calls into apply_patch patches. Keyed off the
+      // advertised catalog, not the model id — inert on OpenCode 2.0 and when
+      // edit/write are available normally.
+      const advertisedNames = new Set(tools.map(t => t.name))
+      const needsPatch = !advertisedNames.has("edit") && !advertisedNames.has("write") && advertisedNames.has("apply_patch")
+      if (needsPatch) {
+        trace(`devin apply_patch bridge: active (catalog=${[...advertisedNames].join(",")}) model=${modelId}`)
       }
+      for (const tc of toolCalls.values()) {
+        let toolName = tc.name
+        let inputStr: string
+        let refused: { reason: string; originalTool: string } | null = null
+        if (needsPatch && (toolName === "write" || toolName === "edit")) {
+          let parsed: unknown
+          try { parsed = JSON.parse(tc.args) } catch { parsed = tc.args }
+          const workspaceRoot = options.workspaceRoot ?? (callOptions as any).workspaceRoot ?? process.cwd()
+          const remapped = remapDevinEditForApplyPatchCatalog({
+            toolName,
+            input: parsed,
+            advertisedToolNames: advertisedNames,
+            workspaceRoot,
+          })
+          if (remapped.type === "patched") {
+            toolName = "apply_patch"
+            inputStr = JSON.stringify({ patchText: remapped.patchText })
+            trace(`devin apply_patch bridge: ${remapped.originalTool} -> apply_patch ${remapped.filePath}`)
+            controller.enqueue({ type: "tool-call", toolCallId: tc.id, toolName, input: inputStr } as unknown as LanguageModelV3StreamPart)
+            continue
+          } else if (remapped.type === "refused") {
+            trace(`devin apply_patch bridge refused ${toolName}: ${remapped.reason}`)
+            refused = { reason: remapped.reason, originalTool: remapped.originalTool }
+          } else {
+            inputStr = typeof parsed === "string" ? parsed : JSON.stringify(parsed)
+            controller.enqueue({ type: "tool-call", toolCallId: tc.id, toolName, input: inputStr } as unknown as LanguageModelV3StreamPart)
+            continue
+          }
+        } else {
+          let parsed: unknown
+          try { parsed = JSON.parse(tc.args) } catch { parsed = tc.args }
+          inputStr = typeof parsed === "string" ? parsed : JSON.stringify(parsed)
+          controller.enqueue({ type: "tool-call", toolCallId: tc.id, toolName, input: inputStr } as unknown as LanguageModelV3StreamPart)
+          continue
+        }
+        if (refused) {
+          const errMsg = `Devin ${refused.originalTool} request cannot be expressed as an apply_patch call: ${refused.reason}. The host advertises \`apply_patch\` instead of \`edit\`/\`write\` for this model.`
+          // Emit as apply_patch so OpenCode surfaces a typed error; also warn in text
+          controller.enqueue({ type: "tool-call", toolCallId: tc.id, toolName: "apply_patch", input: JSON.stringify({ patchText: `*** Begin Patch\n*** Update File: ${errMsg}\n*** End Patch` }) } as unknown as LanguageModelV3StreamPart)
+          if (!textId) {
+            textId = crypto.randomUUID()
+            controller.enqueue({ type: "text-start", id: textId } as LanguageModelV3StreamPart)
+          }
+          controller.enqueue({ type: "text-delta", id: textId, delta: `\n\n⚠️ ${errMsg}\n` } as LanguageModelV3StreamPart)
+          // keep textId open to be closed by outer finalizer
+        }
+      }
+
       if ((finishUnified as string) === "other") finishUnified = (toolCalls.size > 0 ? "tool-calls" : "stop") as any
       const finalUsage = hasUsage ? buildLanguageModelV3UsageFromCounters(counters) : emptyLanguageModelV3Usage()
       // Like cursor's LoggableUsage, expose raw server counters verbatim in providerMetadata

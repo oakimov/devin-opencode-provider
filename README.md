@@ -108,11 +108,31 @@ Model/version caches and Devin project metadata live under a **host cache root**
 
 ### Select a model
 
-Pick a model from the cached list (for example `swe-1-6-slow`):
+Devin discovery returns many flat wire ids (`claude-opus-5-max`, `swe-1-7-lightning-medium`, …). This provider collapses them into **one OpenCode model id per family** with **parameter-only variants** (Cursor-shaped catalog). Pick the base id, then a variant:
 
 ```bash
+# Effort ladder (Claude Opus 5): Low, Low Fast, Medium, …, Max, Max Fast
+opencode run --model devin/claude-opus-5 --variant Max "Hello from Devin via OpenCode"
+
+# SWE-1.7: Medium, Max, Lightning Medium, Lightning Max
+opencode run --model devin/swe-1-7 --variant Max "Refactor this module"
+opencode run --model devin/swe-1-7 --variant "Lightning Max" "Quick fix"
+
+# Flat / unsuffixed ids still work when Devin only exposes one member
 opencode run --model devin/swe-1-6-slow "Hello from Devin via OpenCode"
 ```
+
+In the TUI: choose `devin/<base-id>`, then open the variant picker.
+
+#### Max vs Cursor Max Mode
+
+**Max** here is a high-**effort** variant (`effort=max`), not Cursor’s IDE **Max Mode** toggle (which sets wire `max_mode` and unlocks long-context tiers). Devin has no equivalent Max Mode flag in this catalog. Longer context is a **separate base id** when Devin exposes it (for example `devin/claude-opus-4-6-1m` with `Thinking` / `No Thinking`).
+
+| OpenCode selection | Variant params | Typical Devin wire id |
+|--------------------|----------------|------------------------|
+| `devin/claude-opus-5` + `Max` | `effort=max` | `claude-opus-5-max` |
+| `devin/claude-opus-5` + `Max Fast` | `effort=max`, `fast=true` | `claude-opus-5-max-fast` |
+| `devin/swe-1-7` + `Lightning Max` | `lightning=true`, `effort=max` | `swe-1-7-lightning` (alias) |
 
 ## Programmatic usage
 
@@ -140,6 +160,7 @@ Pass either `accessToken` (JWT from OAuth or key exchange) or `apiKey` (raw key)
 | `DEVIN_API_KEY` | Devin API key (sk-ws-01-..., cog_..., or devin-session-token$...) for auth without `/connect` |
 | `WINDSURF_API_KEY` | Alias for DEVIN_API_KEY (for Windsurf compatibility) |
 | `DEVIN_API_BASE_URL` | Override API base URL (default `https://api.devin.ai`) |
+| `DEVIN_PROVIDER_SHOW_DISABLED` | Set to `1` / `true` to include plan-disabled cascade models in the catalog (useful for debugging Pro vs full lists) |
 | `DEVIN_PROVIDER_DEBUG` | Set to `1` or `true` to enable wire-level debug logging |
 | `DEVIN_PROVIDER_DEBUG_FILE` | Override debug log path (default: `$TMPDIR/devin-provider-logs-<uid>/debug-<pid>.log`) |
 | `XDG_CACHE_HOME` | Base for host cache dirs (`$XDG_CACHE_HOME/opencode/`) |
@@ -169,7 +190,7 @@ OpenCode
 |--------|------|
 | `src/plugin.ts` | OpenCode hooks: provider registration, OAuth, API key exchange |
 | `src/plugin-core.ts` | Host-neutral SDK factory, API base resolution |
-| `src/model-config.ts` | Devin model → OpenCode model mapping |
+| `src/model-config.ts` | Flat Devin models → Cursor-shaped OpenCode bases + parameter-only variants |
 | `src/index.ts` | `createDevin` factory; default export is `DevinPlugin` |
 | `src/language-model.ts` | AI SDK `LanguageModelV3` adapter (`doStream`, `doGenerate`) |
 | `src/auth.ts` | PKCE OAuth, API key exchange, JWT refresh |
@@ -191,7 +212,7 @@ The package root intentionally stays plugin-safe for OpenCode's classic loader.
 |---------|-------------|
 | No Devin models in the picker | Confirm Devin auth (`opencode auth login` → **devin**). Restart OpenCode — if auth is present and the cache is empty, models are fetched on startup. Confirm `provider.devin.npm` is the package name (or a built `file://…/dist/index.js`). |
 | Auth / 401 errors mid-session | Re-login. OAuth and exchanged API-key JWTs refresh automatically when near expiry; a revoked refresh token needs a fresh login. |
-| Empty or stale model list | Delete `<host-cache>/devin-models.json` (default `~/.cache/opencode/`) and restart OpenCode. Existing Devin auth is enough to refill the cache; re-login only if auth itself is broken. |
+| Empty or stale model list / wrong variant order | Fully **restart** the OpenCode TUI after `bun run build` (long-lived processes keep the old plugin). Delete `<host-cache>/devin-models.json` (default `~/.cache/opencode/`) only if discovery itself is stale. Existing Devin auth is enough to refill the cache; re-login only if auth itself is broken. Set `DEVIN_PROVIDER_SHOW_DISABLED=1` if your plan hides most models. |
 
 ## Security
 

@@ -95,3 +95,10 @@ export function trace(msg: string): void {
     /* ignore */
   }
 }
+
+export function traceRequestContextPaths(label: string, requestContext: Record<string, unknown> | undefined): void {
+  if (!DEBUG_ENABLED) return
+  const env = requestContext?.env && typeof requestContext.env === "object" ? (requestContext.env as Record<string, unknown>) : undefined
+  const mcp = requestContext?.mcp_file_system_options && typeof requestContext.mcp_file_system_options === "object" ? (requestContext.mcp_file_system_options as Record<string, unknown>) : undefined
+  trace(`${label}: workspace_paths=${JSON.stringify(env?.workspace_paths ?? null)} process_working_directory=${JSON.stringify(env?.process_working_directory ?? null)} project_folder=${JSON.stringify(env?.project_folder ?? null)} terminals_folder=${JSON.stringify(env?.terminals_folder ?? null)} agent_transcripts_folder=${JSON.stringify(env?.agent_transcripts_folder ?? null)} workspace_project_dir=${JSON.stringify(mcp?.workspace_project_dir ?? null)}`)
+}

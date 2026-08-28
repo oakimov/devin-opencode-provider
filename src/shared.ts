@@ -25,7 +25,7 @@ export const USER_STATUS_PATH = "/exa.seat_management_pb.SeatManagementService/G
 export const USER_JWT_PATH = "/exa.auth_pb.AuthService/GetUserJwt"
 
 export const MODEL_CACHE_FILE = "devin-models.json"
-export const MODEL_CACHE_SCHEMA_VERSION = 1
+export const MODEL_CACHE_SCHEMA_VERSION = 2
 export const MODEL_CACHE_TTL_MS = 86_400_000
 export const VERSION_CACHE_FILE = "devin-client-version.json"
 
