@@ -32,6 +32,12 @@ export type ModelInfo = {
   supportsMaxMode?: boolean
   maxOutput?: number
   variants: ModelVariant[]
+  cost?: {
+    input: number
+    output: number
+    cache_read?: number
+    cache_write?: number
+  }
 }
 
 export class DevinVariantSelectionError extends Error {
@@ -138,6 +144,29 @@ function normalizeModelInfo(value: unknown): ModelInfo | null {
   const maxContextForMaxMode = optionalPositiveNumber(value, ["maxContextForMaxMode", "contextTokenLimitForMaxMode", "context_token_limit_for_max_mode"])
   const maxOutput = optionalPositiveNumber(value, ["maxOutput", "max_output_tokens"])
   if (displayName === null || family === null || supportsThinking === null || supportsAgent === null || supportsImages === null || supportsMaxMode === null || maxContext === null || maxContextForMaxMode === null || maxOutput === null) return null
+  // cost is optional and persisted from RPC pricing (#32)
+  let cost: ModelInfo["cost"] | undefined
+  if (Object.hasOwn(value as Record<string, unknown>, "cost")) {
+    const rawCost = (value as Record<string, unknown>).cost
+    if (rawCost !== undefined) {
+      if (!isPlainRecord(rawCost)) return null
+      const checkCost = (v: unknown): number | null | undefined => {
+        if (v === undefined) return undefined
+        if (typeof v !== "number" || !Number.isFinite(v) || v < 0) return null
+        return v
+      }
+      const rc = rawCost as Record<string, unknown>
+      const input = checkCost(rc.input)
+      const output = checkCost(rc.output)
+      const cacheRead = checkCost((rc as any).cache_read ?? (rc as any).cacheRead)
+      const cacheWrite = checkCost((rc as any).cache_write ?? (rc as any).cacheWrite)
+      if (input === null || output === null || cacheRead === null || cacheWrite === null) return null
+      if (input === undefined || output === undefined) return null
+      cost = { input: input as number, output: output as number }
+      if (cacheRead !== undefined) cost.cache_read = cacheRead as number
+      if (cacheWrite !== undefined) cost.cache_write = cacheWrite as number
+    }
+  }
   return {
     id: value.id,
     ...(displayName === undefined ? {} : { displayName }),
@@ -149,6 +178,7 @@ function normalizeModelInfo(value: unknown): ModelInfo | null {
     ...(maxContextForMaxMode === undefined ? {} : { maxContextForMaxMode }),
     ...(maxOutput === undefined ? {} : { maxOutput }),
     ...(supportsMaxMode === undefined ? {} : { supportsMaxMode }),
+    ...(cost ? { cost } : {}),
     variants: variants as ModelVariant[],
   }
 }
@@ -344,7 +374,26 @@ async function writeCache(cacheDir: string, models: ModelInfo[]): Promise<void> 
   if (!normalized) throw new Error("Refusing to write an invalid Devin model cache")
   const filePath = cacheFilePath(cacheDir)
   const directory = path.dirname(filePath)
-  const tempPath = path.join(directory, `.${MODEL_CACHE_FILE}.${process.pid}.${Date.now()}.tmp`)
+  const tempPath = path.join(
+    directory,
+    `.${MODEL_CACHE_FILE}.${process.pid}.${crypto.randomUUID()}.tmp`,
+  )
+  await mkdir(directory, { recursive: true })
+  try {
+    await writeFile(tempPath, JSON.stringify(normalized, null, 2), "utf-8")
+    await rename(tempPath, filePath)
+  } finally { await unlink(tempPath).catch(() => {}) }
+}
+
+export async function writeCacheDirect(cacheDir: string, cache: ModelCache): Promise<void> {
+  const normalized = normalizeModelCache(cache)
+  if (!normalized) throw new Error("Refusing to write an invalid Devin model cache")
+  const filePath = cacheFilePath(cacheDir)
+  const directory = path.dirname(filePath)
+  const tempPath = path.join(
+    directory,
+    `.${MODEL_CACHE_FILE}.${process.pid}.${crypto.randomUUID()}.tmp`,
+  )
   await mkdir(directory, { recursive: true })
   try {
     await writeFile(tempPath, JSON.stringify(normalized, null, 2), "utf-8")
@@ -356,15 +405,9 @@ export function isCacheFreshWithTtl(cache: ModelCache, ttlMs = MODEL_CACHE_TTL_M
   return isCacheFresh(cache, ttlMs)
 }
 
-/**
- * Fetch live model list — latest endpoints via Devin 3.7.25 decompiled:
- *   Primary: GetCascadeModelConfigs at server.codeium.com (ClientModelConfig#22 model_uid, #1 label, #4 disabled)
- *   Fallback: GetUserStatus seat_management (cascade_model_config_data)
- * Mirrors rsvedant catalog + devin_mock proto_util.
- */
-export async function discoverModels(accessToken: string, cacheDir: string, opts: { baseURL?: string; signal?: AbortSignal } = {}): Promise<ModelInfo[]> {
-  // Real Devin API — per decompiled 3.7.25 and DEVIN_MOCK_SERVER.md, models live at server.codeium.com
-  // Mock is only reference for protocol; never contact 127.0.0.1:50001 in production.
+// ── Fetch + cache orchestration (mirrors cursor provider) ──
+
+async function fetchDevinModels(accessToken: string, opts: { baseURL?: string; signal?: AbortSignal } = {}): Promise<ModelInfo[]> {
   const base = (opts.baseURL ?? process.env.DEVIN_API_BASE_URL ?? process.env.WINDSURF_API_BASE_URL ?? "https://server.codeium.com").replace(/\/$/, "")
   let userJwt: string | undefined
   try { userJwt = await getCachedUserJwt(accessToken, base, opts.signal) } catch {}
@@ -389,7 +432,6 @@ export async function discoverModels(accessToken: string, cacheDir: string, opts
         return null
       }
       let buf = new Uint8Array(await res.arrayBuffer())
-      // Server may return gzip (seen in GetUserStatus captures 1f8b...)
       if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
         try { buf = zlib.gunzipSync(buf as unknown as Buffer) } catch { /* keep raw */ }
       } else {
@@ -418,15 +460,80 @@ export async function discoverModels(accessToken: string, cacheDir: string, opts
     trace(`${c.path} -> ${models.length} models`)
     if (models.length > best.length) best = models
   }
-  const models = best
-  if (models.length) await writeCache(cacheDir, models).catch(() => {})
-  trace(`discoverModels: final ${models.length} models`)
+  return best
+}
+
+const refreshesByDirectory = new Map<string, Promise<ModelInfo[]>>()
+
+export async function refreshModelCache(
+  cacheDir: string,
+  fetcher: () => Promise<ModelInfo[]>,
+): Promise<ModelInfo[]> {
+  const key = path.resolve(cacheDir)
+  const existing = refreshesByDirectory.get(key)
+  if (existing) return existing
+  const refresh = (async () => {
+    const models = await fetcher()
+    await writeCache(cacheDir, models)
+    return models
+  })()
+  refreshesByDirectory.set(key, refresh)
+  try {
+    return await refresh
+  } finally {
+    if (refreshesByDirectory.get(key) === refresh) refreshesByDirectory.delete(key)
+  }
+}
+
+export async function fetchModels(
+  accessToken: string,
+  opts: { baseURL?: string; signal?: AbortSignal } = {},
+): Promise<ModelInfo[]> {
+  return fetchDevinModels(accessToken, opts)
+}
+
+/**
+ * Fetch live model list with stale-while-revalidate and deduplication.
+ * Mirrors cursor provider: fresh cache → serve immediately + background refresh;
+ * stale cache → try refresh, serve stale on failure; no cache → must fetch.
+ */
+export async function discoverModels(accessToken: string, cacheDir: string, opts: { baseURL?: string; signal?: AbortSignal } = {}): Promise<ModelInfo[]> {
+  const cached = await readCache(cacheDir)
+  const fetcher = () => fetchDevinModels(accessToken, opts)
+
+  // Fresh → serve immediately, refresh in background (fire-and-forget)
+  if (cached && isCacheFresh(cached)) {
+    void refreshModelCache(cacheDir, fetcher).catch(() => {})
+    trace(`discoverModels: serving fresh cache ${cached.models.length} models, background refresh started`)
+    return cached.models
+  }
+
+  // Stale but present → try refresh, fall back to stale on failure
+  if (cached) {
+    try {
+      const models = await refreshModelCache(cacheDir, fetcher)
+      trace(`discoverModels: refreshed stale cache -> ${models.length} models`)
+      return models
+    } catch (e) {
+      trace(`discoverModels: refresh failed, serving stale ${cached.models.length} models: ${(e as Error).message}`)
+      return cached.models
+    }
+  }
+
+  // No cache → must fetch (throws on failure)
+  const models = await refreshModelCache(cacheDir, fetcher)
+  trace(`discoverModels: initial fetch -> ${models.length} models`)
   return models
 }
 
 function shouldShowDisabledForDebug(): boolean {
   const v = process.env.DEVIN_PROVIDER_SHOW_DISABLED
   return v === "1" || v === "true"
+}
+
+function f32FromBytes(bytes: Uint8Array): number {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  return view.getFloat32(0, true)
 }
 
 function parseCascadeModelConfigs(buf: Uint8Array): ModelInfo[] {
@@ -444,6 +551,7 @@ function parseCascadeModelConfigs(buf: Uint8Array): ModelInfo[] {
     let family: string | undefined
     let modelInfoBytes: Uint8Array | undefined
     let familyBytes: Uint8Array | undefined
+    const pricingEntries: Array<{ name: string; price: number }> = []
     for (const sf of iterFields(f.value)) {
       if (sf.num === 1 && sf.wire === 2 && sf.value instanceof Uint8Array) label = new TextDecoder().decode(sf.value).trim()
       else if (sf.num === 4 && sf.wire === 0) disabled = sf.value === 1n || sf.value === 1
@@ -454,6 +562,19 @@ function parseCascadeModelConfigs(buf: Uint8Array): ModelInfo[] {
       } else if (sf.num === 22 && sf.wire === 2 && sf.value instanceof Uint8Array) modelUid = new TextDecoder().decode(sf.value).trim()
       else if (sf.num === 23 && sf.wire === 2 && sf.value instanceof Uint8Array) modelInfoBytes = sf.value
       else if (sf.num === 30 && sf.wire === 2 && sf.value instanceof Uint8Array) familyBytes = sf.value
+      else if (sf.num === 32 && sf.wire === 2 && sf.value instanceof Uint8Array) {
+        // Pricing entry: #32 repeated 3x per model (Input, Cached input, Output)
+        // Each entry has #1 name, #2 price (fixed32 float), #3 "1M tokens"
+        let name = ""
+        let price: number | undefined
+        for (const pf of iterFields(sf.value)) {
+          if (pf.num === 1 && pf.wire === 2 && pf.value instanceof Uint8Array) name = new TextDecoder().decode(pf.value).trim()
+          else if (pf.num === 2 && pf.wire === 5 && pf.value instanceof Uint8Array && price === undefined) {
+            try { price = f32FromBytes(pf.value as Uint8Array) } catch {}
+          }
+        }
+        if (name && price !== undefined && Number.isFinite(price)) pricingEntries.push({ name, price })
+      }
     }
     // Enrich from model_info (#23) when available
     if (modelInfoBytes) {
@@ -499,6 +620,19 @@ function parseCascadeModelConfigs(buf: Uint8Array): ModelInfo[] {
       info.supportsAgent = true
       if (maxContext !== undefined) info.maxContext = maxContext
       if (maxOutput !== undefined) info.maxOutput = maxOutput
+      // Pricing from #32 repeated entries (Input, Cached input, Output) — per 1M tokens
+      if (pricingEntries.length > 0) {
+        const find = (name: string) => pricingEntries.find(p => p.name.toLowerCase() === name.toLowerCase())?.price
+        const input = find("Input")
+        const cached = find("Cached input")
+        const output = find("Output")
+        if (input !== undefined && output !== undefined) {
+          info.cost = { input, output }
+          if (cached !== undefined) info.cost.cache_read = cached
+          // cache_write not separately priced in this RPC; use cached price as fallback
+          if (cached !== undefined) info.cost.cache_write = cached
+        }
+      }
       if (disabled && showDisabled) trace(`including disabled ${modelUid} (DEVIN_PROVIDER_SHOW_DISABLED=1)`)
       models.push(info)
     }

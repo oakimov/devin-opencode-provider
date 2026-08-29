@@ -6,6 +6,12 @@ This project is a custom **AI SDK provider** (`LanguageModelV3`) plus an **OpenC
 
 > **Status:** Usable end-to-end for authentication, model discovery, streaming, and tools. See [Known limitations](#known-limitations).
 
+## Demo
+
+OpenCode driving a Devin-routed model through this provider:
+
+![OpenCode running a model via devin-opencode-provider](https://raw.githubusercontent.com/oakimov/devin-opencode-provider/main/assets/screenshot.png)
+
 ## Features
 
 - **OpenCode integration** — registers a `devin` provider with auth hooks and cached model list

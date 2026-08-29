@@ -7,6 +7,7 @@ import { modelsToConfig } from "./model-config.js"
 import { opencodeGlobalCacheDir } from "./context/paths.js"
 import { readStoredAuth, type StoredAuth } from "./context/auth-store.js"
 import { getCachedUserJwt, createLoopbackServer, buildDevinLoginUrl, generatePkceParams, generatePkceChallenge, pollForDevinTokens, isExpiringSoon } from "./auth.js"
+import { trace } from "./debug.js"
 
 const MODULE_URL = new URL("./index.js", import.meta.url).href
 
@@ -20,7 +21,10 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
     await input.client.auth.set({ path: { id: DEVIN_PROVIDER_ID }, body })
   }
   async function persistAuthBestEffort(body: Auth): Promise<void> {
-    try { await persistAuth(body) } catch {}
+    try { await persistAuth(body) } catch (e) {
+      const err = e as Error
+      trace(`persistAuthBestEffort: failed to persist auth: ${err.message}`)
+    }
   }
   async function authFromStore(): Promise<Auth | StoredAuth | undefined> {
     return readStoredAuth(DEVIN_PROVIDER_ID)
@@ -59,20 +63,21 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
 
   async function loadModels(): Promise<Record<string, any>> {
     const cached = await readCache(cacheDir)
-    if (cached?.models.length && isCacheFresh(cached)) {
-      return modelsToConfig(cached.models)
-    }
     const auth = await authFromStore()
-    if (auth) {
-      const accessToken = await resolveAccessToken(auth)
-      if (accessToken) {
-        try {
-          const models = await discoverModels(accessToken, cacheDir, { baseURL: apiBaseURL })
-          return modelsToConfig(models)
-        } catch {}
-      }
+    if (!auth) return cached?.models.length ? modelsToConfig(cached.models) : {}
+    const accessToken = await resolveAccessToken(auth)
+    if (!accessToken) return cached?.models.length ? modelsToConfig(cached.models) : {}
+    try {
+      // discoverModels handles stale-while-revalidate: fresh → serve cached + background refresh,
+      // stale → try refresh with fallback to stale, no cache → must fetch.
+      const models = await discoverModels(accessToken, cacheDir, { baseURL: apiBaseURL })
+      return modelsToConfig(models)
+    } catch (e) {
+      const err = e as Error
+      trace(`loadModels: discovery failed, falling back to cache: ${err.message}`)
+      console.error(`[devin-provider] Model discovery failed: ${err.message}`)
+      return cached?.models.length ? modelsToConfig(cached.models) : {}
     }
-    return cached?.models.length ? modelsToConfig(cached.models) : {}
   }
 
   return {
@@ -125,9 +130,13 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
                 try {
                   const { token } = await pollForDevinTokens({ state, server, codeVerifier: pkce.verifier, apiBaseUrl })
                   // Validate token by minting GetUserJwt against server.codeium.com
-                  await getCachedUserJwt(token, apiBaseURL).catch(() => {})
+                  await getCachedUserJwt(token, apiBaseURL).catch((e) => {
+                    trace(`auth callback: GetUserJwt validation failed: ${(e as Error).message}`)
+                  })
                   // Warm model cache
-                  await discoverModels(token, cacheDir, { baseURL: apiBaseURL }).catch(() => {})
+                  await discoverModels(token, cacheDir, { baseURL: apiBaseURL }).catch((e) => {
+                    trace(`auth callback: model cache warm failed: ${(e as Error).message}`)
+                  })
                   return {
                     type: "success" as const,
                     provider: DEVIN_PROVIDER_ID,
@@ -172,11 +181,14 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
         const auth = await authForLoader(getAuth as () => Promise<Auth | undefined>)
         const accessToken = (auth ? await resolveAccessToken(auth) : undefined) ?? sessionAccessToken ?? (process.env.DEVIN_API_KEY ?? process.env.WINDSURF_API_KEY)
         if (accessToken) {
-          const cached = await readCache(cacheDir)
-          if (!cached || cached.models.length === 0 || !isCacheFresh(cached)) {
-            await discoverModels(accessToken, cacheDir, { baseURL: apiBaseURL }).catch(() => {})
-          }
-          await getCachedUserJwt(accessToken, apiBaseURL).catch(() => {})
+          // Use stale-while-revalidate with deduplication; fresh cache returns immediately
+          // and refreshes in background, so this does not block auth.
+          await discoverModels(accessToken, cacheDir, { baseURL: apiBaseURL }).catch((e) => {
+            trace(`auth loader: model discovery failed: ${(e as Error).message}`)
+          })
+          await getCachedUserJwt(accessToken, apiBaseURL).catch((e) => {
+            trace(`auth loader: GetUserJwt failed: ${(e as Error).message}`)
+          })
           return { accessToken, workspaceRoot: input.directory, cacheDir }
         }
         return { workspaceRoot: input.directory, cacheDir }

@@ -4,6 +4,25 @@ import { concat, encodeMessage, encodeString, encodeVarintField } from "./wire.j
 /**
  * Build Windsurf Metadata proto (exa.codeium_common_pb.Metadata)
  * Minimal load-bearing fields derived from rsvedant CLOUD_DIRECT and devin_mock.
+ *
+ * VERSION DEPENDENCIES:
+ * =====================
+ * The hardcoded version strings below are derived from Devin IDE decompilation (v3.7.25).
+ * These values should be updated when Devin releases significant protocol changes:
+ *
+ * - extensionVersion: "1.48.2" - Windsurf extension version
+ * - ideVersion: "3.6.27" - Devin IDE version
+ * - Platform: "mac" - Hardcoded to macOS for protocol compatibility
+ * - Extension path: macOS-specific Devin.app path
+ * - Plan type: "Free" - May need updates for Pro/Enterprise plan differences
+ *
+ * These values are used for protocol compatibility and may affect:
+ * - Feature availability (some features require specific IDE versions)
+ * - Rate limiting and quota enforcement
+ * - Protocol field acceptance (server may reject unknown versions)
+ *
+ * To update: Capture new values from Devin IDE decompilation or network traces,
+ * then update the defaults in buildMetadata() and document the protocol changes.
  */
 
 export type MetadataOpts = {
@@ -22,7 +41,22 @@ export function buildMetadata(opts: MetadataOpts): Uint8Array {
   const requestId = opts.requestId ?? ++requestCounter
   const sessionId = opts.sessionId ?? crypto.randomUUID()
   const triggerId = opts.triggerId ?? crypto.randomUUID()
-  // Golden 00007 uses 1.48.2 / 3.6.27, mac, Free, and specific paths — replicate to match IDE
+  // VERSION ALIGNMENT NOTE:
+  // These hardcoded versions match a specific Devin IDE release (3.6.27) that was used
+  // to capture and reverse-engineer the protocol. Changing these may cause the API to
+  // reject requests or return different behavior. The values should be updated if:
+  // 1. Devin deprecates this IDE version
+  // 2. The protocol changes significantly
+  // 3. Server-side validation becomes stricter
+  // 
+  // Current versions (verified against Devin IDE 3.6.27 decompiled):
+  // - Extension: 1.48.2 (windsurf extension version)
+  // - IDE: 3.6.27 (Devin Desktop version)
+  // - Platform: mac (hardcoded for consistency)
+  // - Plan: Free (may affect available models/features)
+  //
+  // To update: capture new IDE release, decompile, and extract these values from
+  // the Metadata proto construction in the official client.
   const extVer = opts.extensionVersion ?? "1.48.2"
   const ideVer = opts.ideVersion ?? "3.6.27"
 

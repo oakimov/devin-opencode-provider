@@ -19,6 +19,53 @@ import {
  * parameter-only variants (Cursor shape). The language model reconstructs the
  * wire uid from base + `devinVariantParameters` at request time — variants
  * must never carry a second model id or the catalog looks flat again.
+ *
+ * VARIANT MAPPING STRATEGY:
+ * ========================
+ * Devin's API returns many flat model IDs like:
+ * - claude-opus-5-medium
+ * - claude-opus-5-max-fast
+ * - swe-1-7-lightning-medium
+ * - MODEL_PRIVATE_2 (opaque Sonnet 4.5)
+ *
+ * These are grouped by "display-name-first" logic:
+ * 1. If displayName exists (e.g. "Claude Opus 5 Low Fast"), peel variant phrases
+ * 2. If displayName missing, fall back to id suffix stripping (e.g. "-low-fast")
+ * 3. Group peeled base IDs together into one OpenCode model
+ * 4. Create parameter-only variants for each effort/speed/thinking combo
+ * 5. Register wire-id aliases for opaque IDs that can't be synthesized
+ *
+ * PARAMETER SYNTHESIS:
+ * ===================
+ * Each variant maps to `devinVariantParameters` array:
+ * - effort: none|minimal|low|medium|high|xhigh|max
+ * - fast: true/false (speed suffix)
+ * - lightning: true/false (SWE Lightning models)
+ * - thinking: true/false (reasoning mode)
+ * - reasoning: true/false (alternative reasoning flag)
+ * - priority: true/false (fast variant alternative)
+ * - slow: true/false (slow variant)
+ *
+ * Example mapping:
+ * - "Low Fast" → [{id: "effort", value: "low"}, {id: "fast", value: "true"}]
+ * - "Lightning Max" → [{id: "lightning", value: "true"}, {id: "effort", value: "max"}]
+ * - "No Thinking" → [{id: "thinking", value: "false"}]
+ *
+ * WIRE ID RECONSTRUCTION:
+ * ======================
+ * At request time, `wireModelIdFromBaseAndParams` reconstructs Devin's flat uid:
+ * - Base: "claude-opus-5"
+ * - Params: [{id: "effort", value: "low"}, {id: "fast", value: "true"}]
+ * - Result: "claude-opus-5-low-fast"
+ *
+ * For opaque IDs (MODEL_PRIVATE_*), the alias table provides direct mapping.
+ *
+ * CONTEXT TIERS:
+ * =============
+ * Context tiers like "-1m" stay separate base models rather than Max Mode flags:
+ * - claude-opus-4-6 (200K context)
+ * - claude-opus-4-6-1m (1M context)
+ * This mirrors Devin's model catalog structure.
  */
 
 function stripMarkupTags(value: string): string {
@@ -132,6 +179,13 @@ export function modelInfoToConfig(
       context,
       output,
     },
+  }
+  // Live RPC cost from GetCascadeModelConfigs #32 (Input/Cached/Output)
+  if (mi.cost) {
+    const liveCost: Record<string, unknown> = { input: mi.cost.input, output: mi.cost.output }
+    if (mi.cost.cache_read !== undefined) liveCost.cache_read = mi.cost.cache_read
+    if (mi.cost.cache_write !== undefined) liveCost.cache_write = mi.cost.cache_write
+    config.cost = liveCost
   }
   const variantConfig = modelInfoVariants(mi, mi.variants)
   if (variantConfig) config.variants = variantConfig
@@ -329,6 +383,31 @@ function splitDevinVariant(model: ModelInfo): { baseId: string; variantName: str
   return { baseId: stem + contextSuffix, variantName: null }
 }
 
+/**
+ * Convert human-readable variant names to Devin's parameter format.
+ * 
+ * This function maps display names like "Low Fast", "Thinking", "Max" to Devin's
+ * internal parameter structure that gets reconstructed into wire model IDs at request time.
+ * 
+ * Devin's wire IDs are flat: `claude-opus-5-medium-fast`, `swe-1-7-lightning-max`, etc.
+ * OpenCode uses parameter-only variants, so we need to synthesize these parameters from
+ * display names, then reconstruct the wire ID later using `wireModelIdFromBaseAndParams`.
+ * 
+ * Parameter mapping:
+ * - "fast" / "priority" → fast=true (accelerated generation)
+ * - "lightning" → lightning=true (SWE Lightning models)
+ * - "slow" → slow=true (slower, more thorough)
+ * - "reasoning" → reasoning=true (extended reasoning mode)
+ * - "thinking" / "no thinking" → thinking=true/false (chain-of-thought)
+ * - "low" / "medium" / "high" / "max" / "xhigh" / "none" / "minimal" → effort=<value>
+ * - Other terms → variant=<value> (fallback for unknown variants)
+ * 
+ * The logic handles compound terms like "no thinking" by treating "no" as a modifier
+ * for "thinking" rather than a standalone variant.
+ * 
+ * @param variantName - Human-readable variant name from display labels
+ * @returns Array of parameter objects that can be reconstructed into wire IDs
+ */
 function variantNameToParams(variantName: string): Array<{ id: string; value: string }> {
   const lower = variantName.toLowerCase().replace(/x-high/g, "xhigh")
   const parts = lower.split(/\s+/).filter(Boolean)
@@ -520,6 +599,7 @@ export function modelsToConfig(models: ModelInfo[]): Record<string, any> {
       ...members.map((mm) => mm.model.maxOutput ?? 0),
       representative.maxOutput ?? 0,
     )
+    const cost = members.find((mm) => mm.model.cost)?.model.cost
     const baseInfo: ModelInfo = {
       id: baseId,
       displayName: baseDisplay,
@@ -529,6 +609,7 @@ export function modelsToConfig(models: ModelInfo[]): Record<string, any> {
       ...(supportsImages !== undefined ? { supportsImages } : {}),
       ...(maxContext > 0 ? { maxContext } : {}),
       ...(maxOutput > 0 ? { maxOutput } : {}),
+      ...(cost ? { cost } : {}),
       variants: [],
     }
     // Do not append a " Thinking" name suffix — variants already express that.
