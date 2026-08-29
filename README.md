@@ -10,7 +10,7 @@ This project is a custom **AI SDK provider** (`LanguageModelV3`) plus an **OpenC
 
 OpenCode driving a Devin-routed model through this provider:
 
-![OpenCode running a model via devin-opencode-provider](https://raw.githubusercontent.com/oakimov/devin-opencode-provider/main/assets/screenshot.png)
+![OpenCode running a model via devin-opencode-provider](https://raw.githubusercontent.com/oakimov/devin-opencode-provider/master/assets/screenshot.png)
 
 ## Features
 
