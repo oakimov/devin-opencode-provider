@@ -1,13 +1,13 @@
 {
   "name": "devin-opencode-provider",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Use Devin/Windsurf subscription models from OpenCode via Windsurf's Connect-RPC Cascade protocol",
   "type": "module",
   "license": "MIT",
   "author": "devin-opencode-provider",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/example/devin-opencode-provider.git"
+    "url": "git+https://github.com/oakimov/devin-opencode-provider.git"
   },
   "keywords": [
     "opencode",

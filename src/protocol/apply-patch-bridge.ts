@@ -49,7 +49,7 @@ export function remapDevinEditForApplyPatchCatalog(opts: {
     ? (() => { try { return JSON.parse(input) as Record<string, unknown> } catch { return {} } })()
     : (input && typeof input === "object" ? input as Record<string, unknown> : {})
 
-  const filePath = stringVal(obj.filePath ?? obj.path ?? obj.file_path ?? obj.filename)
+  const filePath = stringVal(obj.filePath ?? obj.path ?? obj.file_path ?? obj.filename ?? obj.target_file ?? obj.file)
   if (!filePath) {
     return { type: "refused", reason: "no target path was provided", originalTool: name }
   }

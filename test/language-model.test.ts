@@ -86,6 +86,26 @@ describe("buildDevinOpenCodeGuidance", () => {
     const g = guids(["edit"])
     expect(g).toContain("capped/partial")
   })
+
+  it("names the host path key from the advertised schema", () => {
+    const oc1 = buildDevinOpenCodeGuidance([{
+      name: "read",
+      description: "",
+      parameters: { type: "object", required: ["filePath"], properties: { filePath: { type: "string" } } },
+    }], "/tmp")!
+    expect(oc1).toContain("Takes `filePath`")
+    expect(oc1).not.toContain("Takes `path` or `filePath`")
+
+    const oc2 = buildDevinOpenCodeGuidance([{
+      name: "read",
+      description: "",
+      parameters: { type: "object", required: ["path"], properties: { path: { type: "string" } } },
+    }], "/tmp")!
+    expect(oc2).toContain("Takes `path`")
+    expect(oc2).not.toContain("`filePath`")
+
+    expect(guids(["read"])).toContain("Takes `path` or `filePath`")
+  })
 })
 
 describe("tool description injection via extractTools (smoke)", () => {

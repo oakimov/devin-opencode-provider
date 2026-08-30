@@ -107,4 +107,11 @@ describe("remapDevinEditForApplyPatchCatalog", () => {
     const r = remapDevinEditForApplyPatchCatalog({ toolName: "write", input: { path: "b.txt", content: "hi" }, advertisedToolNames: ["apply_patch"], workspaceRoot: root })
     expect(r.type).toBe("patched")
   })
+
+  it("accepts target_file as a path alias", async () => {
+    const root = await mkRoot({})
+    const r = remapDevinEditForApplyPatchCatalog({ toolName: "write", input: { target_file: "c.txt", content: "hi" }, advertisedToolNames: new Set(["apply_patch"]), workspaceRoot: root })
+    expect(r.type).toBe("patched")
+    if (r.type === "patched") expect(r.filePath).toBe("c.txt")
+  })
 })

@@ -7,6 +7,7 @@ import type { ChatHistoryItem, ToolDef } from "./protocol/chat.js"
 import { streamChatEvents } from "./protocol/chat.js"
 import { buildLanguageModelV3UsageFromCounters, emptyLanguageModelV3Usage, type DevinUsageCounters } from "./usage.js"
 import { remapDevinEditForApplyPatchCatalog } from "./protocol/apply-patch-bridge.js"
+import { fileArgPhrase, normalizeFileToolArgs } from "./protocol/file-tool-args.js"
 import { extractDevinVariantParameters, resolveDevinWireModelId } from "./models.js"
 import { resolveDevinModelSupportsImages } from "./model-metadata.js"
 import {
@@ -70,58 +71,24 @@ function extractTools(callOptions: LanguageModelV3CallOptions): ToolDef[] {
     // System guidance alone is frequently ignored; the tool's own description is
     // the first thing the model sees when choosing args, so make the contract
     // explicit here as well.
+    const schema = (t as any).inputSchema ?? (t as any).parameters ?? { type: "object", properties: {} }
+    const pathArg = fileArgPhrase(schema)
     if (t.name === "read") {
       description =
-        "Read a text file, image, or directory. Args: `path` (or `filePath`) — absolute or relative to workspace root, optional `offset` (1-based line/entry) and `limit`. Returns raw file text (no `1: ` line-number prefixes, no XML wrapper — those are stripped before you see it). If result ends with `(Output capped at 50 KB` or `Use offset=` the file was truncated: you MUST re-read remaining ranges with `offset`/`limit` before editing or rewriting. Always `read` a file before `edit`."
+        `Read a text file, image, or directory. Args: ${pathArg} — absolute or relative to workspace root, optional \`offset\` (1-based line/entry) and \`limit\`. Returns raw file text (no \`1: \` line-number prefixes, no XML wrapper — those are stripped before you see it). If result ends with \`(Output capped at 50 KB\` or \`Use offset=\` the file was truncated: you MUST re-read remaining ranges with \`offset\`/\`limit\` before editing or rewriting. Always \`read\` a file before \`edit\`.`
     } else if (t.name === "edit") {
       description =
-        "Surgically replace exact text in an EXISTING file. Args: `path` (or `filePath`), `oldString` (exact byte-for-byte match including whitespace/indentation/line breaks, must be unique in file), `newString` (must differ from oldString), optional `replaceAll` (boolean, default false). Include 2–3 lines of exact surrounding context in `oldString` so the match is unambiguous. If tool returns `oldString not found` or `multiple matches`, re-`read` the file and copy a larger exact surrounding block verbatim. Never include line-number prefixes like `1: ` — they are not in the file. Never use `edit` to create a new file; use `write`. Always `read` first."
+        `Surgically replace exact text in an EXISTING file. Args: ${pathArg}, \`oldString\` (exact byte-for-byte match including whitespace/indentation/line breaks, must be unique in file), \`newString\` (must differ from oldString), optional \`replaceAll\` (boolean, default false). Include 2–3 lines of exact surrounding context in \`oldString\` so the match is unambiguous. If tool returns \`oldString not found\` or \`multiple matches\`, re-\`read\` the file and copy a larger exact surrounding block verbatim. Never include line-number prefixes like \`1: \` — they are not in the file. Never use \`edit\` to create a new file; use \`write\`. Always \`read\` first.`
     } else if (t.name === "write") {
       description =
-        "Create a new file or intentionally overwrite an entire existing file. Args: `path` (or `filePath`), `content` (complete file text, all lines). This overwrites — prefer `edit` for small targeted patches. Never pass a truncated/capped `read` result as `content`; re-`read` all ranges first. Ensure parent directory exists. Do not use shell/Python/heredocs for file writes while this tool is available."
+        `Create a new file or intentionally overwrite an entire existing file. Args: ${pathArg}, \`content\` (complete file text, all lines). This overwrites — prefer \`edit\` for small targeted patches. Never pass a truncated/capped \`read\` result as \`content\`; re-\`read\` all ranges first. Ensure parent directory exists. Do not use shell/Python/heredocs for file writes while this tool is available.`
     }
     return {
       name: t.name,
       description,
-      parameters: (t as any).inputSchema ?? (t as any).parameters ?? { type: "object", properties: {} },
+      parameters: schema,
     }
   })
-}
-
-function normalizeFileToolArgs(toolName: string, parsed: unknown): unknown {
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return parsed
-  const obj = parsed as Record<string, unknown>
-  const out: Record<string, unknown> = { ...obj }
-  // Normalize path aliases — OpenCode V2 edit/write/read use `path`, but Devin
-  // often emits `filePath`, `file_path`, `filename`.
-  if (toolName === "read" || toolName === "edit" || toolName === "write") {
-    const p = (obj as any).path ?? (obj as any).filePath ?? (obj as any).file_path ?? (obj as any).filename ?? (obj as any).file
-    if (typeof p === "string" && p) {
-      out.path = p
-      // Keep filePath alias for hosts that accept either, but ensure `path` is set.
-      if (!("path" in obj)) delete (out as any).filePath
-    }
-  }
-  if (toolName === "edit") {
-    const oldS = (obj as any).oldString ?? (obj as any).old_string ?? (obj as any).oldText ?? (obj as any).old_text
-    const newS = (obj as any).newString ?? (obj as any).new_string ?? (obj as any).newText ?? (obj as any).new_text ?? (obj as any).content
-    if (typeof oldS === "string" && !("oldString" in out)) out.oldString = oldS
-    if (typeof newS === "string" && !("newString" in out)) out.newString = newS
-    const ra = (obj as any).replaceAll ?? (obj as any).replace_all
-    if (typeof ra === "boolean" && !("replaceAll" in out)) out.replaceAll = ra
-  }
-  if (toolName === "write") {
-    const c = (obj as any).content ?? (obj as any).file_text ?? (obj as any).text ?? (obj as any).fileText ?? (obj as any).data
-    if (typeof c === "string" && !("content" in out)) out.content = c
-  }
-  if (toolName === "read") {
-    // Ensure limit/offset are numbers if provided as strings
-    for (const k of ["limit", "offset"] as const) {
-      const v = (out as any)[k]
-      if (typeof v === "string" && /^\d+$/.test(v)) (out as any)[k] = Number(v)
-    }
-  }
-  return out
 }
 
 // Opencode's `read` tool wraps file content in XML and caps at 50 KB.
@@ -205,26 +172,32 @@ function toolResultToText(m: unknown): string {
 export function buildDevinOpenCodeGuidance(tools: ToolDef[], workspaceRoot: string): string | undefined {
   if (tools.length === 0) return undefined
   const names = new Set(tools.map(t => t.name))
+  const schemaOf = (name: string) => tools.find(t => t.name === name)?.parameters
   const instructions: string[] = []
 
   // Tight file-tool guidance — Devin frequently fails edits when oldString is
   // hallucinated, truncated, or missing surrounding context, and when capped
   // reads are treated as complete files. Be explicit about exact matching.
+  // Arg names follow the advertised host schema (`filePath` on OpenCode 1.x,
+  // `path` on OpenCode 2.0); when unknown, tell the model either is accepted.
   if (names.has("read")) {
+    const pathArg = fileArgPhrase(schemaOf("read"))
     instructions.push(
-      "- `read` — Takes `filePath` (absolute or relative to workspace root) and optional `offset`/`limit`. Returns raw file text (line-number prefixes and `<path>/<content>` wrapper are already stripped — do not copy `1: ` prefixes into edits). If the result ends with `(Output capped at 50 KB` or `Use offset=` / `requires another offset`, the file was truncated: you MUST re-`read` the remaining ranges with `offset` before using the content. Never pass a capped/partial read as whole-file content to `write`. Always `read` a file before `edit`.",
+      `- \`read\` — Takes ${pathArg} (absolute or relative to workspace root) and optional \`offset\`/\`limit\`. Returns raw file text (line-number prefixes and \`<path>/<content>\` wrapper are already stripped — do not copy \`1: \` prefixes into edits). If the result ends with \`(Output capped at 50 KB\` or \`Use offset=\` / \`requires another offset\`, the file was truncated: you MUST re-\`read\` the remaining ranges with \`offset\` before using the content. Never pass a capped/partial read as whole-file content to \`write\`. Always \`read\` a file before \`edit\`.`,
     )
   }
   if (names.has("edit")) {
+    const pathArg = fileArgPhrase(schemaOf("edit"))
     instructions.push(
-      "- `edit` — For surgical changes to EXISTING files only. Args: `filePath`, `oldString`, `newString`, optional `replaceAll` (boolean). `oldString` MUST match the file byte-for-byte — exact whitespace, indentation, and line breaks — and MUST be unique in the file. Include 2–3 lines of exact surrounding context before and after the target so the match is unambiguous. If the tool returns `oldString not found` or `multiple matches`, re-`read` the file, copy a larger exact surrounding block (verbatim, including indentation), and retry; use `replaceAll:true` only to intentionally change every occurrence. Never include line-number prefixes (e.g. `1: `) in `oldString`/`newString` — they are not in the file. `oldString` and `newString` must differ. To create a new file, use `write`, not `edit`.",
+      `- \`edit\` — For surgical changes to EXISTING files only. Args: ${pathArg}, \`oldString\`, \`newString\`, optional \`replaceAll\` (boolean). \`oldString\` MUST match the file byte-for-byte — exact whitespace, indentation, and line breaks — and MUST be unique in the file. Include 2–3 lines of exact surrounding context before and after the target so the match is unambiguous. If the tool returns \`oldString not found\` or \`multiple matches\`, re-\`read\` the file, copy a larger exact surrounding block (verbatim, including indentation), and retry; use \`replaceAll:true\` only to intentionally change every occurrence. Never include line-number prefixes (e.g. \`1: \`) in \`oldString\`/\`newString\` — they are not in the file. \`oldString\` and \`newString\` must differ. To create a new file, use \`write\`, not \`edit\`.`,
     )
   }
   if (names.has("write")) {
+    const pathArg = fileArgPhrase(schemaOf("write"))
     instructions.push(
       names.has("edit")
-        ? "- `write` — For CREATING new files or intentionally REPLACING an entire file. Args: `filePath`, `content` (complete file text, all lines). This overwrites the file — prefer `edit` for small targeted patches. Never pass a truncated or capped `read` result as `content`; re-`read` all ranges first. Ensure the parent directory exists (create it via `bash mkdir -p` if needed). Do not use shell, Python, or heredocs to change file content while `edit`/`write` are available."
-        : "- `write` — Args: `filePath`, `content` (complete file text). This overwrites. Never pass a truncated `read` as `content`; re-`read` all ranges first. Do not use shell, Python, or heredocs to change file content while `write` is available.",
+        ? `- \`write\` — For CREATING new files or intentionally REPLACING an entire file. Args: ${pathArg}, \`content\` (complete file text, all lines). This overwrites the file — prefer \`edit\` for small targeted patches. Never pass a truncated or capped \`read\` result as \`content\`; re-\`read\` all ranges first. Ensure the parent directory exists (create it via \`bash mkdir -p\` if needed). Do not use shell, Python, or heredocs to change file content while \`edit\`/\`write\` are available.`
+        : `- \`write\` — Args: ${pathArg}, \`content\` (complete file text). This overwrites. Never pass a truncated \`read\` as \`content\`; re-\`read\` all ranges first. Do not use shell, Python, or heredocs to change file content while \`write\` is available.`,
     )
   } else if (names.has("apply_patch")) {
     instructions.push(
@@ -467,6 +440,7 @@ async function doStreamImpl(
       // advertised catalog, not the model id — inert on OpenCode 2.0 and when
       // edit/write are available normally.
       const advertisedNames = new Set(tools.map(t => t.name))
+      const schemaOf = (name: string) => tools.find(t => t.name === name)?.parameters
       const needsPatch = !advertisedNames.has("edit") && !advertisedNames.has("write") && advertisedNames.has("apply_patch")
       if (needsPatch) {
         trace(`devin apply_patch bridge: active (catalog=${[...advertisedNames].join(",")}) model=${modelId}`)
@@ -495,7 +469,7 @@ async function doStreamImpl(
             trace(`devin apply_patch bridge refused ${toolName}: ${remapped.reason}`)
             refused = { reason: remapped.reason, originalTool: remapped.originalTool }
           } else {
-            const normalized = normalizeFileToolArgs(toolName, parsed)
+            const normalized = normalizeFileToolArgs(toolName, parsed, schemaOf(toolName))
             inputStr = typeof normalized === "string" ? normalized : JSON.stringify(normalized)
             controller.enqueue({ type: "tool-call", toolCallId: tc.id, toolName, input: inputStr } as unknown as LanguageModelV3StreamPart)
             continue
@@ -503,10 +477,12 @@ async function doStreamImpl(
         } else {
           let parsed: unknown
           try { parsed = JSON.parse(tc.args) } catch { parsed = tc.args }
-          const normalized = normalizeFileToolArgs(toolName, parsed)
-          if (normalized !== parsed) {
-            try { trace(`devin arg normalize ${toolName}: ${JSON.stringify(parsed).slice(0, 200)} -> ${JSON.stringify(normalized).slice(0, 200)}`) } catch {}
-          }
+          const normalized = normalizeFileToolArgs(toolName, parsed, schemaOf(toolName))
+          try {
+            const before = typeof parsed === "string" ? parsed : JSON.stringify(parsed)
+            const after = typeof normalized === "string" ? normalized : JSON.stringify(normalized)
+            if (before !== after) trace(`devin arg normalize ${toolName}: ${before.slice(0, 200)} -> ${after.slice(0, 200)}`)
+          } catch {}
           inputStr = typeof normalized === "string" ? normalized : JSON.stringify(normalized)
           controller.enqueue({ type: "tool-call", toolCallId: tc.id, toolName, input: inputStr } as unknown as LanguageModelV3StreamPart)
           continue

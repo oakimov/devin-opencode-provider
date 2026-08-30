@@ -43,3 +43,8 @@ This directory contains development notes and lessons learned during development
 ### Agent tooling
 - Keep `oldString` minimal but unique (2-3 lines with indentation) to avoid ambiguous matches.
 - Do not commit/push unless the user asks
+
+### File-tool arg names (read/edit/write)
+- OpenCode 1.x requires `filePath`; OpenCode 2.0 requires `path`. Devin emits `filePath`.
+- Never rewrite to only `path` and drop `filePath` — host validation is `SchemaError(Missing key at ["filePath"])`.
+- Inspect the advertised JSON schema; if unknown, keep **both** keys. See `src/protocol/file-tool-args.ts`.
