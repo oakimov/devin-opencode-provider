@@ -6,7 +6,7 @@ import { readCache, discoverModels, isCacheFresh } from "./models.js"
 import { modelsToConfig } from "./model-config.js"
 import { opencodeGlobalCacheDir } from "./context/paths.js"
 import { readStoredAuth, type StoredAuth } from "./context/auth-store.js"
-import { getCachedUserJwt, createLoopbackServer, buildDevinLoginUrl, generatePkceParams, generatePkceChallenge, pollForDevinTokens, isExpiringSoon } from "./auth.js"
+import { getCachedUserJwt, createLoopbackServer, buildDevinLoginUrl, generatePkceParams, generatePkceChallenge, pollForDevinTokens, isExpiringSoon, decodeJwtExpiryMs } from "./auth.js"
 import { trace } from "./debug.js"
 
 const MODULE_URL = new URL("./index.js", import.meta.url).href
@@ -137,10 +137,13 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
                   await discoverModels(token, cacheDir, { baseURL: apiBaseURL }).catch((e) => {
                     trace(`auth callback: model cache warm failed: ${(e as Error).message}`)
                   })
+                  const jwt = token.includes("$") ? (token.split("$").pop() ?? token) : token
                   return {
                     type: "success" as const,
                     provider: DEVIN_PROVIDER_ID,
-                    key: token,
+                    access: token,
+                    refresh: "",
+                    expires: decodeJwtExpiryMs(jwt) ?? Date.now() + 3_600_000,
                   }
                 } finally {
                   server.close()
@@ -197,6 +200,6 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
   }
 }
 
-// Aliases for compatibility with opencode plugin loader expectations
-export const WindsurfPlugin = DevinPlugin
-export const CursorPlugin = DevinPlugin
+// Back-compat aliases moved to devin-opencode-provider/compat subpath
+// so the package root stays plugin-safe and pi-bridge auto-detect works
+// with a single `DevinPlugin` export (like cursor's single `CursorPlugin`).

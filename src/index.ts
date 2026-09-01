@@ -18,10 +18,14 @@ export function createDevin(options: CreateDevinOptions) {
   return createSdk(options)
 }
 
-// Back-compat naming: also expose createWindsurf
-export const createWindsurf = createDevin
-export const createCursor = createDevin
-
 export { DevinPlugin }
-export { DevinPlugin as WindsurfPlugin }
 export default DevinPlugin
+
+// Keep root runtime exports plugin-safe. OpenCode's legacy plugin loader
+// treats package-root exports as potential plugins, so extra public runtime
+// APIs belong on subpaths such as "devin-opencode-provider/errors".
+//
+// Windsurf/Cursor aliases are retained for back-compat on subpath
+// "devin-opencode-provider/compat" — see src/compat.ts — but are NOT
+// re-exported here so pi-bridge's `createXxx` / `*Plugin` auto-detection
+// sees a single factory and a single plugin, like cursor-opencode-provider.
