@@ -54,3 +54,22 @@ describe("image-input module contract", () => {
     expect(() => mod.assertDevinUserImageSupport(lastUser, false, "op-test")).not.toThrow()
   })
 })
+
+describe("attachment support helpers", () => {
+  it("exports document/video extractors", async () => {
+    const mod = await import("../src/image-input.js")
+    expect(typeof mod.extractDevinPromptAttachments).toBe("function")
+    expect(typeof mod.assertDevinUserAttachmentSupport).toBe("function")
+    expect(typeof mod.attachmentToContentPart).toBe("function")
+  })
+
+  it("assertDevinUserAttachmentSupport rejects pdf when documents unsupported", async () => {
+    const mod = await import("../src/image-input.js")
+    const lastUser: any = { role: "user", content: [{ type: "file", mediaType: "application/pdf" }] }
+    expect(() => mod.assertDevinUserAttachmentSupport(
+      lastUser,
+      { supportsImages: true, supportsVideo: true, supportsDocuments: false },
+      "m",
+    )).toThrow()
+  })
+})

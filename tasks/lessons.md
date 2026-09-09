@@ -48,3 +48,20 @@ This directory contains development notes and lessons learned during development
 - OpenCode 1.x requires `filePath`; OpenCode 2.0 requires `path`. Devin emits `filePath`.
 - Never rewrite to only `path` and drop `filePath` — host validation is `SchemaError(Missing key at ["filePath"])`.
 - Inspect the advertised JSON schema; if unknown, keep **both** keys. See `src/protocol/file-tool-args.ts`.
+
+### Devin 3.9.19 wire (2026-09-09)
+- `GetChatMessageRequest.#27 prompt_cache_key` — send stable key (OpenCode `x-session-id` / cascade id); do not invent a new UUID every turn.
+- `prompt_id` is **#17**, `execution_id` is **#22** (older builds wrongly put promptId on #22).
+- `ChatMessagePrompt.#20 VideoData` / `#21 DocumentData` — encode OpenCode `file` parts (not text placeholders).
+- Parse `ModelInfo.#6 ModelFeatures` for `#11` images, `#15` thinking, `#27` video, `#29` documents; advertise OpenCode `pdf` modality when documents are on.
+- Skip catalog uid `subagent-default` (Task wire token, not a chat model).
+- `control_type` on family metadata is CLI-picker-only; OpenCode variants still come from display-name peeling.
+- Inject extracted attachments onto the last user message — extraction alone is not enough.
+
+### Empty model cache must not be "fresh" (2026-09-09)
+Schema bump + a failed/empty discovery wrote `devin-models.json` with
+`models: []` and a current `fetchedAt`. `isCacheFresh` treated it as valid
+for 24h → OpenCode opened with Devin uninitialized (no models). Fix: empty
+caches are never fresh; refuse to write empty; discovery returning 0 throws
+so stale non-empty cache can still be served. Delete
+`~/.cache/opencode/devin-models.json` once to recover immediately.

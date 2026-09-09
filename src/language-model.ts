@@ -1,20 +1,38 @@
 import type { LanguageModelV3, LanguageModelV3CallOptions, LanguageModelV3StreamResult, LanguageModelV3GenerateResult, LanguageModelV3StreamPart, LanguageModelV3Usage } from "@ai-sdk/provider"
+import * as crypto from "node:crypto"
 import type { CreateDevinOptions } from "./index.js"
 import { getCachedUserJwt, resolveBearerToken } from "./auth.js"
 import { devinApiBaseURL } from "./plugin-core.js"
 import { trace } from "./debug.js"
-import type { ChatHistoryItem, ToolDef } from "./protocol/chat.js"
+import type { ChatHistoryItem, ContentPart, ToolDef } from "./protocol/chat.js"
 import { streamChatEvents } from "./protocol/chat.js"
 import { buildLanguageModelV3UsageFromCounters, emptyLanguageModelV3Usage, type DevinUsageCounters } from "./usage.js"
 import { remapDevinEditForApplyPatchCatalog } from "./protocol/apply-patch-bridge.js"
 import { fileArgPhrase, normalizeFileToolArgs } from "./protocol/file-tool-args.js"
 import { extractDevinVariantParameters, resolveDevinWireModelId } from "./models.js"
-import { resolveDevinModelSupportsImages } from "./model-metadata.js"
 import {
-  assertDevinUserImageSupport,
-  extractDevinPromptImages,
-  hasDevinUserImages,
+  resolveDevinModelSupportsDocuments,
+  resolveDevinModelSupportsImages,
+  resolveDevinModelSupportsVideo,
+} from "./model-metadata.js"
+import {
+  assertDevinUserAttachmentSupport,
+  attachmentToContentPart,
+  extractDevinPromptAttachments,
+  hasDevinUserFileAttachments,
 } from "./image-input.js"
+
+/** OpenCode session id header, if present — used for cascade/prompt_cache_key affinity. */
+export function opencodeSessionKey(callOptions: LanguageModelV3CallOptions): string | undefined {
+  const h = callOptions.headers ?? {}
+  const raw =
+    h["x-session-id"] ??
+    h["X-Session-Id"] ??
+    h["x-session-affinity"] ??
+    h["x-opencode-session"]
+  if (typeof raw === "string" && raw.trim().length > 0) return raw.trim()
+  return undefined
+}
 
 function extractSystemPrompt(prompt: LanguageModelV3CallOptions["prompt"]): string | undefined {
   const sys = prompt.filter(m => m.role === "system").map(m => {
@@ -32,32 +50,77 @@ function extractHistory(prompt: LanguageModelV3CallOptions["prompt"]): ChatHisto
     if (m.role === "system") continue
     if (m.role === "user") {
       const c = (m as any).content
-      let content: string | any[] = ""
+      let content: string | ContentPart[] = ""
       if (typeof c === "string") content = c
-      else if (Array.isArray(c)) content = c.map((p: any) => {
-        if (p.type === "text") return { type: "text", text: p.text }
-        if (p.type === "image") return { type: "image", mimeType: p.mediaType ?? "image/png", base64Data: typeof p.image === "string" ? p.image : "" }
-        if (p.type === "file") return { type: "text", text: `[file: ${p.filename ?? "file"}]` }
-        return { type: "text", text: String(p.text ?? "") }
-      })
-      else content = String(c ?? "")
-      out.push({ role: "user", content } as ChatHistoryItem)
+      else if (Array.isArray(c)) {
+        // File parts are resolved asynchronously in doStreamImpl (attachments).
+        // Keep text/image here; placeholders for unresolved files are replaced later.
+        content = c
+          .map((p: any): ContentPart | null => {
+            if (p.type === "text") return { type: "text", text: p.text }
+            if (p.type === "image") {
+              return {
+                type: "image",
+                mimeType: p.mediaType ?? "image/png",
+                base64Data: typeof p.image === "string" ? p.image : "",
+              }
+            }
+            if (p.type === "file") return null
+            return { type: "text", text: String(p.text ?? "") }
+          })
+          .filter((p: ContentPart | null): p is ContentPart => p !== null)
+      } else content = String(c ?? "")
+      out.push({ role: "user", content })
     } else if (m.role === "assistant") {
       const c = (m as any).content
       let text = ""
+      let thinking = ""
       if (typeof c === "string") text = c
-      else if (Array.isArray(c)) text = c.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n")
+      else if (Array.isArray(c)) {
+        const texts: string[] = []
+        const thoughts: string[] = []
+        for (const p of c as any[]) {
+          if (p.type === "text") texts.push(p.text)
+          else if (p.type === "reasoning" || p.type === "thinking") {
+            const t = typeof p.text === "string" ? p.text : typeof p.thinking === "string" ? p.thinking : ""
+            if (t) thoughts.push(t)
+          }
+        }
+        text = texts.join("\n")
+        thinking = thoughts.join("\n")
+      }
       const toolCalls = (m as any).toolCalls as Array<{ toolCallId: string; toolName: string; input: unknown }> | undefined
-      out.push({
+      const item: ChatHistoryItem = {
         role: "assistant",
         content: text,
         tool_calls: toolCalls?.map(tc => ({ id: tc.toolCallId, name: tc.toolName, arguments: JSON.stringify(tc.input ?? {}) })),
-      })
+      }
+      if (thinking) item.thinking = thinking
+      out.push(item)
     } else if ((m as any).role === "tool") {
       const raw = m as unknown as { role: "tool"; toolCallId: string; toolName?: string; name?: string; result?: unknown; content?: unknown; output?: unknown }
       const text = toolResultToText({ toolName: raw.toolName ?? raw.name, result: raw.result ?? raw.content ?? raw.output ?? raw })
       out.push({ role: "tool", content: text, tool_call_id: raw.toolCallId })
     }
+  }
+  return out
+}
+
+function injectAttachmentsOntoLastUser(
+  messages: ChatHistoryItem[],
+  attachments: ReturnType<typeof attachmentToContentPart>[],
+): ChatHistoryItem[] {
+  if (!attachments.length) return messages
+  const out = messages.map((m) => ({ ...m }))
+  for (let i = out.length - 1; i >= 0; i--) {
+    if (out[i].role !== "user") continue
+    const existing = out[i].content
+    const parts: ContentPart[] = typeof existing === "string"
+      ? (existing ? [{ type: "text", text: existing }] : [])
+      : Array.isArray(existing) ? [...existing] : []
+    for (const att of attachments) parts.push(att as ContentPart)
+    out[i] = { ...out[i], content: parts }
+    break
   }
   return out
 }
@@ -306,40 +369,47 @@ async function doStreamImpl(
     trace(`devin variant: opencodeId=${modelId} wireId=${wireModelId} picked=${picked ? JSON.stringify(picked) : "none"}`)
   }
 
-  // Image support check mirrors cursor/src/language-model.ts:948-982
+  // Attachment support (images + video/document from Devin 3.9.19 ModelFeatures)
   const lastUserRaw = [...callOptions.prompt].reverse().find((m) => (m as any).role === "user") as unknown as
     | Record<string, unknown>
     | undefined
   const supportsImages = resolveDevinModelSupportsImages(wireModelId, undefined)
-  if (lastUserRaw) {
-    assertDevinUserImageSupport(lastUserRaw, supportsImages, wireModelId)
-    if (!supportsImages && hasDevinUserImages(lastUserRaw)) {
-      trace(`image input: dropping user images for model=${wireModelId} (no support)`)
-    }
+  const supportsVideo = resolveDevinModelSupportsVideo(wireModelId, undefined)
+  const supportsDocuments = resolveDevinModelSupportsDocuments(wireModelId, undefined)
+  const attachCaps = { supportsImages, supportsVideo, supportsDocuments }
+  if (lastUserRaw && hasDevinUserFileAttachments(lastUserRaw)) {
+    assertDevinUserAttachmentSupport(lastUserRaw, attachCaps, wireModelId)
   }
-  let imageExtraction: Awaited<ReturnType<typeof extractDevinPromptImages>> | undefined
+  let attachmentExtraction: Awaited<ReturnType<typeof extractDevinPromptAttachments>> | undefined
   try {
-    imageExtraction = await extractDevinPromptImages(
+    attachmentExtraction = await extractDevinPromptAttachments(
       callOptions.prompt as readonly unknown[],
       lastUserRaw,
-      { supportsImages, signal: callOptions.abortSignal as AbortSignal | undefined },
+      { ...attachCaps, signal: callOptions.abortSignal as AbortSignal | undefined },
     )
-    if (!supportsImages && imageExtraction.candidateCount > 0) {
-      trace(`image input: dropped ${imageExtraction.candidateCount} history image(s); model=${wireModelId} does not support images`)
+    if (attachmentExtraction.duplicateCount > 0) {
+      trace(`attachments: skipped ${attachmentExtraction.duplicateCount} duplicate history image(s)`)
     }
-    if (imageExtraction.duplicateCount > 0) {
-      trace(`image input: skipped ${imageExtraction.duplicateCount} duplicate history image(s)`)
-    }
-    if (imageExtraction.images.length > 0) {
-      trace(`image input: ${imageExtraction.userImageCount} user + ${imageExtraction.images.length - imageExtraction.userImageCount} history image(s) for ${wireModelId} totalBytes=${imageExtraction.images.reduce((n: number, i: { data: Uint8Array }) => n + i.data.length, 0)}`)
+    if (attachmentExtraction.attachments.length > 0) {
+      const kinds = attachmentExtraction.attachments.map((a) => a.kind).join(",")
+      trace(
+        `attachments: ${attachmentExtraction.userAttachmentCount} user + `
+        + `${attachmentExtraction.attachments.length - attachmentExtraction.userAttachmentCount} history `
+        + `for ${wireModelId} kinds=${kinds}`,
+      )
     }
   } catch (e) {
-    // Gating errors (unsupported) surface as provider errors
     throw e
   }
 
   const systemPrompt = extractSystemPrompt(callOptions.prompt)
   let messages = extractHistory(callOptions.prompt)
+  if (attachmentExtraction?.attachments.length) {
+    messages = injectAttachmentsOntoLastUser(
+      messages,
+      attachmentExtraction.attachments.map(attachmentToContentPart),
+    )
+  }
   const tools = extractTools(callOptions)
   const workspaceRoot = options.workspaceRoot ?? (callOptions as any).workspaceRoot ?? process.cwd()
   const guidance = buildDevinOpenCodeGuidance(tools, workspaceRoot)
@@ -351,7 +421,11 @@ async function doStreamImpl(
     messages = [{ role: "system", content: systemPrompt }, ...messages]
   }
 
-  trace(`devin doStream model=${modelId} wire=${wireModelId} host=${host} msgs=${messages.length} tools=${tools.length} toolNames=${tools.map(t => t.name).join(",")}`)
+  const sessionKey = opencodeSessionKey(callOptions)
+  const cascadeId = sessionKey ?? crypto.randomUUID()
+  const promptCacheKey = sessionKey ?? cascadeId
+
+  trace(`devin doStream model=${modelId} wire=${wireModelId} host=${host} msgs=${messages.length} tools=${tools.length} toolNames=${tools.map(t => t.name).join(",")} cascade=${cascadeId.slice(0, 8)} cacheKey=${promptCacheKey.slice(0, 8)}`)
 
   const stream = new ReadableStream<LanguageModelV3StreamPart>({
     async start(controller) {
@@ -367,7 +441,18 @@ async function doStreamImpl(
       const toFinishReason = (unified: string, raw?: string): any => ({ unified, raw })
 
       try {
-        for await (const ev of streamChatEvents({ apiKey, apiServerUrl: host, modelUid: wireModelId, messages, tools: tools.length ? tools : undefined, signal: callOptions.abortSignal, userJwt })) {
+        for await (const ev of streamChatEvents({
+          apiKey,
+          apiServerUrl: host,
+          modelUid: wireModelId,
+          messages,
+          tools: tools.length ? tools : undefined,
+          cascadeId,
+          sessionId: cascadeId,
+          promptCacheKey,
+          signal: callOptions.abortSignal,
+          userJwt,
+        })) {
           if (callOptions.abortSignal?.aborted) break
           if (ev.kind === "text") {
             if (!textId) {

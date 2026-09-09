@@ -27,6 +27,8 @@ export type ModelInfo = {
   supportsThinking?: boolean
   supportsAgent?: boolean
   supportsImages?: boolean
+  supportsVideo?: boolean
+  supportsDocuments?: boolean
   maxContext?: number
   maxContextForMaxMode?: number
   supportsMaxMode?: boolean
@@ -139,11 +141,13 @@ function normalizeModelInfo(value: unknown): ModelInfo | null {
   const supportsThinking = optionalBoolean(value, ["supportsThinking", "supports_thinking"])
   const supportsAgent = optionalBoolean(value, ["supportsAgent", "supports_agent"])
   const supportsImages = optionalBoolean(value, ["supportsImages", "supports_images"])
+  const supportsVideo = optionalBoolean(value, ["supportsVideo", "supports_video"])
+  const supportsDocuments = optionalBoolean(value, ["supportsDocuments", "supports_documents"])
   const supportsMaxMode = optionalBoolean(value, ["supportsMaxMode", "supports_max_mode"])
   const maxContext = optionalPositiveNumber(value, ["maxContext", "contextTokenLimit", "context_token_limit"])
   const maxContextForMaxMode = optionalPositiveNumber(value, ["maxContextForMaxMode", "contextTokenLimitForMaxMode", "context_token_limit_for_max_mode"])
   const maxOutput = optionalPositiveNumber(value, ["maxOutput", "max_output_tokens"])
-  if (displayName === null || family === null || supportsThinking === null || supportsAgent === null || supportsImages === null || supportsMaxMode === null || maxContext === null || maxContextForMaxMode === null || maxOutput === null) return null
+  if (displayName === null || family === null || supportsThinking === null || supportsAgent === null || supportsImages === null || supportsVideo === null || supportsDocuments === null || supportsMaxMode === null || maxContext === null || maxContextForMaxMode === null || maxOutput === null) return null
   // cost is optional and persisted from RPC pricing (#32)
   let cost: ModelInfo["cost"] | undefined
   if (Object.hasOwn(value as Record<string, unknown>, "cost")) {
@@ -174,6 +178,8 @@ function normalizeModelInfo(value: unknown): ModelInfo | null {
     ...(supportsThinking === undefined ? {} : { supportsThinking }),
     ...(supportsAgent === undefined ? {} : { supportsAgent }),
     ...(supportsImages === undefined ? {} : { supportsImages }),
+    ...(supportsVideo === undefined ? {} : { supportsVideo }),
+    ...(supportsDocuments === undefined ? {} : { supportsDocuments }),
     ...(maxContext === undefined ? {} : { maxContext }),
     ...(maxContextForMaxMode === undefined ? {} : { maxContextForMaxMode }),
     ...(maxOutput === undefined ? {} : { maxOutput }),
@@ -366,10 +372,16 @@ export async function readCache(cacheDir: string): Promise<ModelCache | null> {
 
 export function isCacheFresh(cache: ModelCache, ttlMs = MODEL_CACHE_TTL_MS): boolean {
   if (cache.schemaVersion !== MODEL_CACHE_SCHEMA_VERSION) return false
+  // Empty caches are never "fresh" — a failed discovery must not lock the
+  // picker empty for the full TTL (schema bumps previously did this).
+  if (!cache.models.length) return false
   return Date.now() - cache.fetchedAt < ttlMs
 }
 
 async function writeCache(cacheDir: string, models: ModelInfo[]): Promise<void> {
+  if (!models.length) {
+    throw new Error("Refusing to write an empty Devin model cache")
+  }
   const normalized = normalizeModelCache({ models, fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION })
   if (!normalized) throw new Error("Refusing to write an invalid Devin model cache")
   const filePath = cacheFilePath(cacheDir)
@@ -474,6 +486,9 @@ export async function refreshModelCache(
   if (existing) return existing
   const refresh = (async () => {
     const models = await fetcher()
+    if (!models.length) {
+      throw new Error("Devin model discovery returned 0 models")
+    }
     await writeCache(cacheDir, models)
     return models
   })()
@@ -546,6 +561,9 @@ function parseCascadeModelConfigs(buf: Uint8Array): ModelInfo[] {
     let modelUid = ""
     let disabled = false
     let supportsImages: boolean | undefined
+    let supportsVideo: boolean | undefined
+    let supportsDocuments: boolean | undefined
+    let supportsThinkingFromFeatures: boolean | undefined
     let maxContext: number | undefined
     let maxOutput: number | undefined
     let family: string | undefined
@@ -591,6 +609,16 @@ function parseCascadeModelConfigs(buf: Uint8Array): ModelInfo[] {
             const maybe = new TextDecoder().decode(mf.value).trim()
             if (maybe) family = maybe.split("/")[0]
           }
+        } else if (mf.num === 6 && mf.wire === 2 && mf.value instanceof Uint8Array) {
+          // ModelFeatures — images #11, thinking #15, video #27, documents #29
+          for (const feat of iterFields(mf.value)) {
+            if (feat.wire !== 0) continue
+            const on = feat.value === 1n || feat.value === 1
+            if (feat.num === 11 && supportsImages === undefined) supportsImages = on
+            else if (feat.num === 15) supportsThinkingFromFeatures = on
+            else if (feat.num === 27) supportsVideo = on
+            else if (feat.num === 29) supportsDocuments = on
+          }
         }
       }
     }
@@ -603,18 +631,26 @@ function parseCascadeModelConfigs(buf: Uint8Array): ModelInfo[] {
         }
       }
     }
+    // Wire token for Task/subagent — not a chat picker model.
+    if (modelUid === "subagent-default") {
+      trace("skip wire uid subagent-default (not a chat model)")
+      continue
+    }
     if (modelUid && !seen.has(modelUid)) {
       if (disabled && !showDisabled) {
         trace(`skip disabled ${modelUid}`)
         continue
       }
       seen.add(modelUid)
-      // Infer supportsThinking from label or family metadata (Devin labels like "Claude Opus 4.6 Thinking")
-      const supportsThinking = /thinking/i.test(label) || /thinking/i.test(modelUid)
+      // Infer supportsThinking from label/uid or ModelFeatures.#15
+      const supportsThinking = supportsThinkingFromFeatures
+        ?? (/thinking/i.test(label) || /thinking/i.test(modelUid))
       const displayName = label || modelUid
       const info: ModelInfo = { id: modelUid, displayName, variants: [] }
       if (family) info.family = family
       if (supportsImages !== undefined) info.supportsImages = supportsImages
+      if (supportsVideo !== undefined) info.supportsVideo = supportsVideo
+      if (supportsDocuments !== undefined) info.supportsDocuments = supportsDocuments
       if (supportsThinking) info.supportsThinking = true
       // All Devin models support tool calling via Cascade
       info.supportsAgent = true

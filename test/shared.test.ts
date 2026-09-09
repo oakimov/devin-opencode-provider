@@ -16,7 +16,7 @@ describe("shared constants", () => {
 
   it("exports cache file constants", () => {
     expect(Shared.MODEL_CACHE_FILE).toBe("devin-models.json")
-    expect(Shared.MODEL_CACHE_SCHEMA_VERSION).toBe(3)
+    expect(Shared.MODEL_CACHE_SCHEMA_VERSION).toBe(4)
     expect(Shared.MODEL_CACHE_TTL_MS).toBe(86_400_000)
   })
 

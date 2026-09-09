@@ -56,20 +56,26 @@ describe("normalizeModelCache", () => {
 })
 
 describe("isCacheFresh", () => {
-  it("is fresh within TTL and correct schema", () => {
-    expect(isCacheFresh({ models: [], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION })).toBe(true)
+  const sample = [{ id: "m1", variants: [] }]
+
+  it("is fresh within TTL and correct schema when non-empty", () => {
+    expect(isCacheFresh({ models: sample as any, fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION })).toBe(true)
+  })
+
+  it("is never fresh when models are empty", () => {
+    expect(isCacheFresh({ models: [], fetchedAt: Date.now(), schemaVersion: MODEL_CACHE_SCHEMA_VERSION })).toBe(false)
   })
 
   it("is stale when expired", () => {
-    expect(isCacheFresh({ models: [], fetchedAt: Date.now() - MODEL_CACHE_TTL_MS - 1, schemaVersion: MODEL_CACHE_SCHEMA_VERSION })).toBe(false)
+    expect(isCacheFresh({ models: sample as any, fetchedAt: Date.now() - MODEL_CACHE_TTL_MS - 1, schemaVersion: MODEL_CACHE_SCHEMA_VERSION })).toBe(false)
   })
 
   it("is stale when schema mismatched", () => {
-    expect(isCacheFresh({ models: [], fetchedAt: Date.now(), schemaVersion: 999 } as any)).toBe(false)
+    expect(isCacheFresh({ models: sample as any, fetchedAt: Date.now(), schemaVersion: 999 } as any)).toBe(false)
   })
 
   it("respects custom ttl", () => {
-    const c = { models: [], fetchedAt: Date.now() - 1000, schemaVersion: MODEL_CACHE_SCHEMA_VERSION }
+    const c = { models: sample as any, fetchedAt: Date.now() - 1000, schemaVersion: MODEL_CACHE_SCHEMA_VERSION }
     expect(isCacheFresh(c, 500)).toBe(false)
     expect(isCacheFresh(c, 5000)).toBe(true)
   })

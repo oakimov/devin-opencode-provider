@@ -16,9 +16,11 @@ OpenCode plugin + AI SDK provider that runs Devin subscription models by speakin
 
 - Text input/output
 - Image input (for supported models)
+- Video / document attachments (`VideoData` / `DocumentData` on `GetChatMessage`)
 - Tool calls
-- Reasoning/thinking deltas
+- Reasoning/thinking deltas (and `#11` thinking replay on history)
 - Token usage tracking
+- Stable `prompt_cache_key` (#27) from OpenCode session headers
 
 ## Model variants
 

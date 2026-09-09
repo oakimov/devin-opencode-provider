@@ -60,6 +60,17 @@ describe("modelInfoToConfig", () => {
     expect(cfg.modalities.input).toEqual(["text", "image"])
   })
 
+  it("advertises pdf modality when documents supported", () => {
+    const cfg = modelInfoToConfig(makeModel({
+      id: "docs",
+      supportsImages: false,
+      supportsDocuments: true,
+    } as any))
+    expect(cfg.attachment).toBe(true)
+    expect(cfg.modalities.input).toContain("pdf")
+    expect(cfg.modalities.input).not.toContain("image")
+  })
+
   it("sets reasoning true when supportsThinking", () => {
     const cfg = modelInfoToConfig(makeModel({ id: "op", supportsThinking: true }))
     expect(cfg.reasoning).toBe(true)

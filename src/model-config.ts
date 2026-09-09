@@ -8,7 +8,9 @@ import {
 import { applyDevinModelCost } from "./pricing.js"
 import {
   getDocumentedDevinModelContext,
+  resolveDevinModelSupportsDocuments,
   resolveDevinModelSupportsImages,
+  resolveDevinModelSupportsVideo,
 } from "./model-metadata.js"
 
 /**
@@ -165,14 +167,20 @@ export function modelInfoToConfig(
   const context = mi.maxContext ?? documentedContext?.maxContext ?? 200_000
   const output = mi.maxOutput ?? 32_000
   const supportsImages = resolveDevinModelSupportsImages(mi.id, mi.supportsImages)
+  const supportsVideo = resolveDevinModelSupportsVideo(mi.id, mi.supportsVideo)
+  const supportsDocuments = resolveDevinModelSupportsDocuments(mi.id, mi.supportsDocuments)
+  const inputModalities = ["text"]
+  if (supportsImages) inputModalities.push("image")
+  if (supportsDocuments) inputModalities.push("pdf")
+  // OpenCode has no first-class "video" modality label; keep attachment on when any file-like input works.
   const config: Record<string, any> = {
     name,
-    attachment: supportsImages,
+    attachment: supportsImages || supportsVideo || supportsDocuments,
     reasoning: mi.supportsThinking ?? false,
     tool_call: mi.supportsAgent ?? true,
     temperature: false,
     modalities: {
-      input: supportsImages ? ["text", "image"] : ["text"],
+      input: inputModalities,
       output: ["text"],
     },
     limit: {
@@ -589,6 +597,16 @@ export function modelsToConfig(models: ModelInfo[]): Record<string, any> {
       : members.every((mm) => mm.model.supportsImages === false)
         ? false
         : representative.supportsImages
+    const supportsVideo = members.some((mm) => mm.model.supportsVideo === true)
+      ? true
+      : members.every((mm) => mm.model.supportsVideo === false)
+        ? false
+        : representative.supportsVideo
+    const supportsDocuments = members.some((mm) => mm.model.supportsDocuments === true)
+      ? true
+      : members.every((mm) => mm.model.supportsDocuments === false)
+        ? false
+        : representative.supportsDocuments
     const maxContext = Math.max(
       0,
       ...members.map((mm) => mm.model.maxContext ?? 0),
@@ -607,6 +625,8 @@ export function modelsToConfig(models: ModelInfo[]): Record<string, any> {
       ...(supportsReasoning ? { supportsThinking: true } : {}),
       ...(representative.supportsAgent ? { supportsAgent: true } : {}),
       ...(supportsImages !== undefined ? { supportsImages } : {}),
+      ...(supportsVideo !== undefined ? { supportsVideo } : {}),
+      ...(supportsDocuments !== undefined ? { supportsDocuments } : {}),
       ...(maxContext > 0 ? { maxContext } : {}),
       ...(maxOutput > 0 ? { maxOutput } : {}),
       ...(cost ? { cost } : {}),

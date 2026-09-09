@@ -8,12 +8,16 @@ import { DevinProviderError } from "../errors.js"
 export type ContentPart =
   | { type: "text"; text: string }
   | { type: "image"; mimeType: string; base64Data: string; caption?: string }
+  | { type: "video"; mimeType: string; base64Data?: string; url?: string }
+  | { type: "document"; mimeType: string; filename?: string; base64Data?: string; url?: string }
 
 export type ChatHistoryItem = {
   role: "user" | "assistant" | "system" | "tool"
   content: string | ContentPart[]
   tool_call_id?: string
   tool_calls?: Array<{ id: string; name: string; arguments: string }>
+  /** Assistant thinking text → ChatMessagePrompt.#11 (preserve_thinking replay). */
+  thinking?: string
 }
 
 export type ToolDef = {
@@ -47,6 +51,28 @@ function encodeImageData(img: { mimeType: string; base64Data: string; caption?: 
   return concat(...parts)
 }
 
+function encodeVideoData(vid: { mimeType: string; base64Data?: string; url?: string }): Uint8Array {
+  const parts: Uint8Array[] = []
+  if (vid.base64Data) parts.push(encodeString(1, vid.base64Data))
+  if (vid.mimeType) parts.push(encodeString(2, vid.mimeType))
+  if (vid.url) parts.push(encodeString(3, vid.url))
+  return concat(...parts)
+}
+
+function encodeDocumentData(doc: {
+  mimeType: string
+  filename?: string
+  base64Data?: string
+  url?: string
+}): Uint8Array {
+  const parts: Uint8Array[] = []
+  if (doc.base64Data) parts.push(encodeString(1, doc.base64Data))
+  if (doc.mimeType) parts.push(encodeString(2, doc.mimeType))
+  if (doc.filename) parts.push(encodeString(3, doc.filename))
+  if (doc.url) parts.push(encodeString(4, doc.url))
+  return concat(...parts)
+}
+
 function encodeChatToolCall(tc: { id: string; name: string; arguments: string }): Uint8Array {
   return concat(
     encodeString(1, tc.id),
@@ -70,7 +96,27 @@ function normalizeContent(content: string | ContentPart[] | unknown): ContentPar
     if (!p || typeof p !== "object") continue
     if (p.type === "text" && typeof p.text === "string") out.push({ type: "text", text: p.text })
     else if (p.type === "image" && typeof p.base64Data === "string") {
-      out.push({ type: "image", mimeType: typeof p.mimeType === "string" ? p.mimeType : "image/png", base64Data: p.base64Data, caption: typeof p.caption === "string" ? p.caption : undefined })
+      out.push({
+        type: "image",
+        mimeType: typeof p.mimeType === "string" ? p.mimeType : "image/png",
+        base64Data: p.base64Data,
+        caption: typeof p.caption === "string" ? p.caption : undefined,
+      })
+    } else if (p.type === "video" && (typeof p.base64Data === "string" || typeof p.url === "string")) {
+      out.push({
+        type: "video",
+        mimeType: typeof p.mimeType === "string" ? p.mimeType : "video/mp4",
+        base64Data: typeof p.base64Data === "string" ? p.base64Data : undefined,
+        url: typeof p.url === "string" ? p.url : undefined,
+      })
+    } else if (p.type === "document" && (typeof p.base64Data === "string" || typeof p.url === "string" || typeof p.filename === "string")) {
+      out.push({
+        type: "document",
+        mimeType: typeof p.mimeType === "string" ? p.mimeType : "application/octet-stream",
+        filename: typeof p.filename === "string" ? p.filename : undefined,
+        base64Data: typeof p.base64Data === "string" ? p.base64Data : undefined,
+        url: typeof p.url === "string" ? p.url : undefined,
+      })
     } else if (p.type === "image_url" && (p as any).image_url) {
       const imgRef = (p as any).image_url as string | { url?: string }
       const url: string = typeof imgRef === "string" ? imgRef : (imgRef.url ?? "")
@@ -92,9 +138,9 @@ function collapseSystemIntoUser(messages: ChatHistoryItem[]): ChatHistoryItem[] 
     } else if (m.role === "user" && pending.length) {
       const parts = normalizeContent(m.content)
       const userText = flush(parts)
-      const images = parts.filter(p => p.type === "image")
+      const attachments = parts.filter(p => p.type === "image" || p.type === "video" || p.type === "document")
       const wrapped = `<system>\n${pending.join("\n\n")}\n</system>\n${userText}`
-      out.push({ role: "user", content: [{ type: "text", text: wrapped }, ...images] })
+      out.push({ role: "user", content: [{ type: "text", text: wrapped }, ...attachments] })
       pending = []
     } else {
       out.push(m)
@@ -104,9 +150,19 @@ function collapseSystemIntoUser(messages: ChatHistoryItem[]): ChatHistoryItem[] 
   return out
 }
 
-function encodeChatMessagePrompt(content: ContentPart[], source: number, opts?: { toolCallId?: string; toolCalls?: Array<{ id: string; name: string; arguments: string }> }): Uint8Array {
+function encodeChatMessagePrompt(
+  content: ContentPart[],
+  source: number,
+  opts?: {
+    toolCallId?: string
+    toolCalls?: Array<{ id: string; name: string; arguments: string }>
+    thinking?: string
+  },
+): Uint8Array {
   const textParts = content.filter((p): p is { type: "text"; text: string } => p.type === "text")
-  const imageParts = content.filter((p): p is { type: "image"; mimeType: string; base64Data: string; caption?: string } => p.type === "image")
+  const imageParts = content.filter((p): p is Extract<ContentPart, { type: "image" }> => p.type === "image")
+  const videoParts = content.filter((p): p is Extract<ContentPart, { type: "video" }> => p.type === "video")
+  const documentParts = content.filter((p): p is Extract<ContentPart, { type: "document" }> => p.type === "document")
   const joined = textParts.map(p => p.text).join("\n")
   const parts: Uint8Array[] = [
     encodeVarintField(2, source),
@@ -119,6 +175,9 @@ function encodeChatMessagePrompt(content: ContentPart[], source: number, opts?: 
     for (const tc of opts.toolCalls) parts.push(encodeMessage(6, encodeChatToolCall(tc)))
   }
   for (const img of imageParts) parts.push(encodeMessage(10, encodeImageData(img)))
+  if (opts?.thinking) parts.push(encodeString(11, opts.thinking))
+  for (const vid of videoParts) parts.push(encodeMessage(20, encodeVideoData(vid)))
+  for (const doc of documentParts) parts.push(encodeMessage(21, encodeDocumentData(doc)))
   return concat(...parts)
 }
 
@@ -159,6 +218,9 @@ type BuildArgs = {
   cascadeId: string
   promptId: string
   sessionId: string
+  /** Stable Responses/provider cache affinity (GetChatMessageRequest.#27). */
+  promptCacheKey?: string
+  executionId?: string
   requestId: bigint
   triggerId: string
   tools?: ToolDef[]
@@ -169,9 +231,19 @@ type BuildArgs = {
 export function buildGetChatMessageRequest(args: BuildArgs): Uint8Array {
   const metadata = buildMetadata({ apiKey: args.apiKey, userJwt: args.userJwt, sessionId: args.sessionId, requestId: args.requestId, triggerId: args.triggerId })
   const collapsed = collapseSystemIntoUser(args.messages)
-  const promptParts = collapsed.map(m => encodeMessage(3, encodeChatMessagePrompt(normalizeContent(m.content), SOURCE_BY_ROLE[m.role] ?? 1, { toolCallId: m.role === "tool" ? m.tool_call_id : undefined, toolCalls: m.role === "assistant" ? m.tool_calls : undefined })))
+  const promptParts = collapsed.map(m => encodeMessage(3, encodeChatMessagePrompt(
+    normalizeContent(m.content),
+    SOURCE_BY_ROLE[m.role] ?? 1,
+    {
+      toolCallId: m.role === "tool" ? m.tool_call_id : undefined,
+      toolCalls: m.role === "assistant" ? m.tool_calls : undefined,
+      thinking: m.role === "assistant" ? m.thinking : undefined,
+    },
+  )))
   const completion = encodeCompletionConfiguration(args.completionOpts ?? {})
   const toolParts: Uint8Array[] = (args.tools ?? []).map(t => encodeMessage(10, encodeToolDef(t)))
+  const cacheKey = (args.promptCacheKey || args.cascadeId || args.sessionId).trim()
+  const executionId = (args.executionId || args.promptId).trim()
   return concat(
     encodeMessage(1, metadata),
     ...promptParts,
@@ -179,8 +251,10 @@ export function buildGetChatMessageRequest(args: BuildArgs): Uint8Array {
     encodeMessage(8, completion),
     ...toolParts,
     encodeString(16, args.cascadeId),
+    encodeString(17, args.promptId), // prompt_id (was wrongly on #22)
     encodeString(21, args.modelUid),
-    encodeString(22, args.promptId),
+    encodeString(22, executionId), // execution_id
+    ...(cacheKey ? [encodeString(27, cacheKey)] : []),
   )
 }
 
@@ -309,11 +383,16 @@ export async function* streamChatEvents(req: {
   messages: ChatHistoryItem[]
   tools?: ToolDef[]
   cascadeId?: string
+  /** OpenCode/session affinity for metadata + prompt_cache_key. */
+  sessionId?: string
+  promptCacheKey?: string
   signal?: AbortSignal
   userJwt: string
 }): AsyncGenerator<CloudChatEvent> {
   const host = (req.apiServerUrl ?? "https://server.codeium.com").replace(/\/$/, "")
   const cascadeId = req.cascadeId ?? crypto.randomUUID()
+  const sessionId = req.sessionId ?? cascadeId
+  const promptId = crypto.randomUUID()
   const proto = buildGetChatMessageRequest({
     apiKey: req.apiKey,
     userJwt: req.userJwt,
@@ -321,8 +400,10 @@ export async function* streamChatEvents(req: {
     messages: req.messages,
     tools: req.tools,
     cascadeId,
-    promptId: crypto.randomUUID(),
-    sessionId: crypto.randomUUID(),
+    promptId,
+    sessionId,
+    executionId: promptId,
+    promptCacheKey: req.promptCacheKey ?? cascadeId,
     requestId: BigInt(Date.now()),
     triggerId: crypto.randomUUID(),
   })
