@@ -150,6 +150,36 @@ function collapseSystemIntoUser(messages: ChatHistoryItem[]): ChatHistoryItem[] 
   return out
 }
 
+/**
+ * Drop tool messages that have no matching assistant tool_call_id.
+ *
+ * When OpenCode aborts / compacts mid-turn, history can contain a tool result
+ * whose assistant tool call never made it into the prompt (issue #1 follow-up).
+ * The backend cannot pair an orphan tool message and fails the whole request
+ * with `invalid_argument: an internal error occurred`, so we drop orphans and
+ * let the turn continue as text instead of hard-failing every retry.
+ */
+function dropOrphanToolMessages(messages: ChatHistoryItem[]): ChatHistoryItem[] {
+  const knownIds = new Set<string>()
+  for (const m of messages) {
+    if (m.role === "assistant" && m.tool_calls) {
+      for (const tc of m.tool_calls) if (tc.id) knownIds.add(tc.id)
+    }
+  }
+  return messages.filter((m) => {
+    if (m.role !== "tool") return true
+    if (!m.tool_call_id) {
+      trace("dropOrphanToolMessages: dropping tool message without tool_call_id")
+      return false
+    }
+    if (!knownIds.has(m.tool_call_id)) {
+      trace(`dropOrphanToolMessages: dropping orphan tool result ${m.tool_call_id.slice(0, 12)} (no matching assistant tool call)`)
+      return false
+    }
+    return true
+  })
+}
+
 function encodeChatMessagePrompt(
   content: ContentPart[],
   source: number,
@@ -230,7 +260,7 @@ type BuildArgs = {
 
 export function buildGetChatMessageRequest(args: BuildArgs): Uint8Array {
   const metadata = buildMetadata({ apiKey: args.apiKey, userJwt: args.userJwt, sessionId: args.sessionId, requestId: args.requestId, triggerId: args.triggerId })
-  const collapsed = collapseSystemIntoUser(args.messages)
+  const collapsed = dropOrphanToolMessages(collapseSystemIntoUser(args.messages))
   const promptParts = collapsed.map(m => encodeMessage(3, encodeChatMessagePrompt(
     normalizeContent(m.content),
     SOURCE_BY_ROLE[m.role] ?? 1,

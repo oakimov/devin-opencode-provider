@@ -44,7 +44,8 @@ function extractSystemPrompt(prompt: LanguageModelV3CallOptions["prompt"]): stri
   return sys || undefined
 }
 
-function extractHistory(prompt: LanguageModelV3CallOptions["prompt"]): ChatHistoryItem[] {
+/** Exported for issue #1 round-trip tests (AI SDK v3 tool-call shapes). */
+export function extractHistory(prompt: LanguageModelV3CallOptions["prompt"]): ChatHistoryItem[] {
   const out: ChatHistoryItem[] = []
   for (const m of prompt) {
     if (m.role === "system") continue
@@ -75,6 +76,7 @@ function extractHistory(prompt: LanguageModelV3CallOptions["prompt"]): ChatHisto
       const c = (m as any).content
       let text = ""
       let thinking = ""
+      const inlineToolCalls: Array<{ toolCallId: string; toolName: string; input: unknown }> = []
       if (typeof c === "string") text = c
       else if (Array.isArray(c)) {
         const texts: string[] = []
@@ -84,23 +86,48 @@ function extractHistory(prompt: LanguageModelV3CallOptions["prompt"]): ChatHisto
           else if (p.type === "reasoning" || p.type === "thinking") {
             const t = typeof p.text === "string" ? p.text : typeof p.thinking === "string" ? p.thinking : ""
             if (t) thoughts.push(t)
+          } else if (p.type === "tool-call") {
+            // AI SDK v3 / OpenCode shape: tool calls live inside
+            // assistant.content[] (issue #1). The legacy m.toolCalls shape
+            // below is kept for back-compat.
+            if (typeof p.toolCallId === "string" && typeof p.toolName === "string") {
+              inlineToolCalls.push({ toolCallId: p.toolCallId, toolName: p.toolName, input: (p as any).input ?? (p as any).args ?? {} })
+            }
           }
         }
         text = texts.join("\n")
         thinking = thoughts.join("\n")
       }
-      const toolCalls = (m as any).toolCalls as Array<{ toolCallId: string; toolName: string; input: unknown }> | undefined
+      const legacyToolCalls = (m as any).toolCalls as Array<{ toolCallId: string; toolName: string; input: unknown }> | undefined
+      const merged = [...(legacyToolCalls ?? []), ...inlineToolCalls]
       const item: ChatHistoryItem = {
         role: "assistant",
         content: text,
-        tool_calls: toolCalls?.map(tc => ({ id: tc.toolCallId, name: tc.toolName, arguments: JSON.stringify(tc.input ?? {}) })),
+        tool_calls: merged.length ? merged.map(tc => ({ id: tc.toolCallId, name: tc.toolName, arguments: typeof tc.input === "string" ? tc.input : JSON.stringify(tc.input ?? {}) })) : undefined,
       }
       if (thinking) item.thinking = thinking
       out.push(item)
     } else if ((m as any).role === "tool") {
-      const raw = m as unknown as { role: "tool"; toolCallId: string; toolName?: string; name?: string; result?: unknown; content?: unknown; output?: unknown }
-      const text = toolResultToText({ toolName: raw.toolName ?? raw.name, result: raw.result ?? raw.content ?? raw.output ?? raw })
-      out.push({ role: "tool", content: text, tool_call_id: raw.toolCallId })
+      const raw = m as unknown as { role: "tool"; toolCallId?: string; toolName?: string; name?: string; result?: unknown; content?: unknown; output?: unknown }
+      // AI SDK v3 / OpenCode shape: tool results live inside tool.content[]
+      // as { type: "tool-result", toolCallId, output } (issue #1). The legacy
+      // flat { toolCallId, result/content/output } shape is kept for back-compat.
+      let toolCallId = raw.toolCallId
+      let result: unknown = (raw as any).result ?? (raw as any).output
+      const c = (raw as any).content
+      if (Array.isArray(c)) {
+        const part = (c as any[]).find(p => p && typeof p === "object" && (p as any).type === "tool-result") as any
+        if (part) {
+          if (!toolCallId && typeof part.toolCallId === "string") toolCallId = part.toolCallId
+          result = part.output ?? part.result ?? part.value ?? result
+        } else if ((raw as any).result === undefined && (raw as any).output === undefined) {
+          result = c
+        }
+      } else if (c !== undefined && (raw as any).result === undefined && (raw as any).output === undefined) {
+        result = c
+      }
+      const text = toolResultToText({ toolName: raw.toolName ?? raw.name, result: result ?? raw })
+      out.push({ role: "tool", content: text, tool_call_id: toolCallId })
     }
   }
   return out
