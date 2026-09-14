@@ -349,7 +349,20 @@ export function resolveDevinWireModelId(
   // Opaque PRIVATE_* (and any future non-synthesizable) mappings win over suffix synthesis.
   const alias = lookupDevinWireIdAlias(fallback, picked)
   if (alias) return alias
-  return wireModelIdFromBaseAndParams(fallback, picked)
+  const synthesized = wireModelIdFromBaseAndParams(fallback, picked)
+  if (synthesized !== fallback) return synthesized
+  // Bare base ids are display-only groupings (e.g. "swe-2" → "swe-2-medium").
+  // The Cascade backend rejects the bare id with permission_denied, so fall
+  // back to the catalog default variant instead of sending it raw.
+  // Only apply to known grouped bases (alias table populated by modelsToConfig
+  // or the swe family); unknown ids pass through unchanged for back-compat.
+  const knownGrouped =
+    lookupDevinWireIdAlias(fallback, []) !== undefined ||
+    lookupDevinWireIdAlias(fallback, [{ id: "effort", value: "medium" }]) !== undefined ||
+    /^(swe|swe-1|swe-2)/.test(fallback) ||
+    fallback === "claude-sonnet-5"
+  if (knownGrouped) return fallback + "-medium"
+  return synthesized
 }
 
 export type ModelCache = {

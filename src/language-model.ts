@@ -364,6 +364,16 @@ async function doStreamImpl(
   })()
   // OpenCode id is the base (`claude-opus-5`); Devin wire uid is synthesized
   // from variant params (`claude-opus-5-medium`). Matches Cursor's one-id shape.
+  // Prime the alias table from the model cache so bare base ids (e.g. `swe-2`)
+  // resolve to their default variant even when OpenCode sends no params.
+  // Fire-and-forget is fine: resolveDevinWireModelId falls back to synthesis.
+  try {
+    const { readCache } = await import("./models.js")
+    const { modelsToConfig } = await import("./model-config.js")
+    const { opencodeGlobalCacheDir } = await import("./context/paths.js")
+    const _c = await readCache(options.cacheDir ?? opencodeGlobalCacheDir())
+    if (_c?.models.length) modelsToConfig(_c.models)
+  } catch {}
   const wireModelId = resolveDevinWireModelId(devinOpts, modelId, picked)
   if (picked || wireModelId !== modelId) {
     trace(`devin variant: opencodeId=${modelId} wireId=${wireModelId} picked=${picked ? JSON.stringify(picked) : "none"}`)

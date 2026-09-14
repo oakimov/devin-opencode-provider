@@ -675,14 +675,20 @@ export function modelsToConfig(models: ModelInfo[]): Record<string, any> {
         [DEVIN_VARIANT_PARAMETERS_KEY]: row.params,
       }
     }
+    // Register the bare base id → default wire id alias so callers that pass
+    // no variant params (empty array or undefined) still resolve to a real uid.
+    // Without this the backend rejects the bare id (permission_denied).
     baseConfig.variants = variants
     // Default = first sorted variant (lowest effort / No Thinking), not discovery order.
     const defaultRow =
       rows.find((r) => r.key === "No Thinking" || r.key === "None" || r.key === "Default") ??
       rows[0]
-    if (defaultRow && defaultRow.params.length > 0) {
-      baseConfig.options = {
-        [DEVIN_VARIANT_PARAMETERS_KEY]: defaultRow.params,
+    if (defaultRow) {
+      registerDevinWireIdAlias(baseId, [], defaultRow.wireId)
+      if (defaultRow.params.length > 0) {
+        baseConfig.options = {
+          [DEVIN_VARIANT_PARAMETERS_KEY]: defaultRow.params,
+        }
       }
     }
     out[baseId] = applyDevinModelCost(baseId, baseConfig)
