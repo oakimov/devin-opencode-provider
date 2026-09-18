@@ -1,6 +1,6 @@
 {
   "name": "devin-opencode-provider",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Use Devin/Windsurf subscription models from OpenCode via Windsurf's Connect-RPC Cascade protocol",
   "type": "module",
   "license": "MIT",
