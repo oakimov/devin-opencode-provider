@@ -1,6 +1,6 @@
 import path from "node:path"
 import { pathToFileURL } from "node:url"
-import type { Hooks, PluginInput, AuthOAuthResult, Config } from "@opencode-ai/plugin"
+import type { Hooks, PluginInput, AuthOAuthResult, Config, ToolDefinition } from "@opencode-ai/plugin"
 import type { Auth } from "@opencode-ai/sdk"
 import {
   DEVIN_PROVIDER_ID,
@@ -138,7 +138,7 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
       // so this host-side fallback survives that filter. OpenCode 2.0 does
       // not advertise this fallback: public ToolContext cannot request
       // permission, so that entrypoint uses `ctx.websearch.transform`.
-      custom_websearch: classicTools.webSearch,
+      custom_websearch: classicTools.webSearch as ToolDefinition,
     },
 
     async "tool.execute.before"(
@@ -151,8 +151,8 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
     },
 
     async "shell.env"(
-      hookInput: { callID: string },
-      output: { env: Record<string, string | undefined> },
+      hookInput: { cwd: string; sessionID?: string; callID?: string },
+      output: { env: Record<string, string> },
     ) {
       const env = devinShellEnvForCall(hookInput.callID)
       if (!env || !output || typeof output !== "object" || !Object.isExtensible(output)) return
