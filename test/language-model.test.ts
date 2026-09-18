@@ -367,4 +367,16 @@ describe("tool description injection via extractTools (smoke)", () => {
     expect(g.split("\n").length).toBeGreaterThan(5)
     expect(g).toContain("OpenCode exposes exactly these executable tools")
   })
+
+  it("names the advertised shell tool in write/search guidance", () => {
+    expect(guids(["write", "edit", "shell"])).toContain("`shell mkdir -p`")
+    expect(guids(["grep", "shell"])).toContain("via `shell`")
+    expect(guids(["write", "edit", "bash"])).toContain("`bash mkdir -p`")
+  })
+
+  it("names the advertised task executor", () => {
+    expect(guids(["subagent"])).toContain("`subagent`")
+    expect(guids(["task", "subagent"])).toContain("`task`")
+    expect(guids(["todowrite", "todoread"])).toContain("`todowrite` / `todoread`")
+  })
 })

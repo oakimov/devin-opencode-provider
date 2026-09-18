@@ -1,5 +1,6 @@
 import type { LanguageModelV3, LanguageModelV3CallOptions, LanguageModelV3StreamResult, LanguageModelV3GenerateResult, LanguageModelV3StreamPart, LanguageModelV3Usage } from "@ai-sdk/provider"
 import * as crypto from "node:crypto"
+import path from "node:path"
 import type { CreateDevinOptions } from "./index.js"
 import { getCachedUserJwt, resolveBearerToken } from "./auth.js"
 import { devinApiBaseURL } from "./plugin-core.js"
@@ -9,6 +10,11 @@ import { streamChatEvents } from "./protocol/chat.js"
 import { buildLanguageModelV3UsageFromCounters, emptyLanguageModelV3Usage, type DevinUsageCounters } from "./usage.js"
 import { remapDevinEditForApplyPatchCatalog } from "./protocol/apply-patch-bridge.js"
 import { fileArgPhrase, normalizeFileToolArgs } from "./protocol/file-tool-args.js"
+import {
+  advertisedToolNames,
+  hostShellTool,
+  remapEmittedToolCall,
+} from "./protocol/host-dialect.js"
 import { extractDevinVariantParameters, lookupDevinWireIdAlias, resolveDevinWireModelId } from "./models.js"
 import {
   resolveDevinModelSupportsDocuments,
@@ -21,6 +27,9 @@ import {
   extractDevinPromptAttachments,
   hasDevinUserFileAttachments,
 } from "./image-input.js"
+import { DEVIN_COMPACTION_OPTION } from "./shared.js"
+import { isCompactionSession } from "./compaction-marker.js"
+import { getSessionDirectory } from "./session-directory.js"
 
 /** OpenCode session id header, if present — used for cascade/prompt_cache_key affinity. */
 export function opencodeSessionKey(callOptions: LanguageModelV3CallOptions): string | undefined {
@@ -303,6 +312,7 @@ export function buildDevinOpenCodeGuidance(tools: ToolDef[], workspaceRoot: stri
   const names = new Set(tools.map(t => t.name))
   const schemaOf = (name: string) => tools.find(t => t.name === name)?.parameters
   const instructions: string[] = []
+  const shell = hostShellTool(names)
 
   // Tight file-tool guidance — Devin frequently fails edits when oldString is
   // hallucinated, truncated, or missing surrounding context, and when capped
@@ -325,7 +335,7 @@ export function buildDevinOpenCodeGuidance(tools: ToolDef[], workspaceRoot: stri
     const pathArg = fileArgPhrase(schemaOf("write"))
     instructions.push(
       names.has("edit")
-        ? `- \`write\` — For CREATING new files or intentionally REPLACING an entire file. Args: ${pathArg}, \`content\` (complete file text, all lines). This overwrites the file — prefer \`edit\` for small targeted patches. Never pass a truncated or capped \`read\` result as \`content\`; re-\`read\` all ranges first. Ensure the parent directory exists (create it via \`bash mkdir -p\` if needed). Do not use shell, Python, or heredocs to change file content while \`edit\`/\`write\` are available.`
+        ? `- \`write\` — For CREATING new files or intentionally REPLACING an entire file. Args: ${pathArg}, \`content\` (complete file text, all lines). This overwrites the file — prefer \`edit\` for small targeted patches. Never pass a truncated or capped \`read\` result as \`content\`; re-\`read\` all ranges first. Ensure the parent directory exists (create it via \`${shell} mkdir -p\` if needed). Do not use shell, Python, or heredocs to change file content while \`edit\`/\`write\` are available.`
         : `- \`write\` — Args: ${pathArg}, \`content\` (complete file text). This overwrites. Never pass a truncated \`read\` as \`content\`; re-\`read\` all ranges first. Do not use shell, Python, or heredocs to change file content while \`write\` is available.`,
     )
   } else if (names.has("apply_patch")) {
@@ -344,13 +354,23 @@ export function buildDevinOpenCodeGuidance(tools: ToolDef[], workspaceRoot: stri
   if (names.has("grep") || names.has("glob")) {
     const preferred = ["grep", "glob"].filter(n => names.has(n)).map(n => `\`${n}\``).join(" and ")
     instructions.push(
-      `- For code search, use OpenCode ${preferred} instead of shell \`rg\`/\`grep\`/\`find\` via \`bash\`.`,
+      `- For code search, use OpenCode ${preferred} instead of shell \`rg\`/\`grep\`/\`find\` via \`${shell}\`.`,
     )
   }
 
   // Question tool, if advertised, is the way to ask user
   if (names.has("question")) {
     instructions.push("- When user input is required, call the OpenCode `question` tool.")
+  }
+  if (names.has("task") || names.has("subagent")) {
+    const target = names.has("task") ? "task" : "subagent"
+    instructions.push(
+      `- For delegated subagents, call OpenCode \`${target}\` (not a Devin-native Task tool).`,
+    )
+  }
+  if (names.has("todowrite") || names.has("todoread")) {
+    const listed = ["todowrite", "todoread"].filter((n) => names.has(n)).map((n) => `\`${n}\``).join(" / ")
+    instructions.push(`- For a session task list, use OpenCode ${listed}.`)
   }
 
   const header = `OpenCode exposes exactly these executable tools for this turn: ${[...names].map(n => `\`${n}\``).join(", ")}.`
@@ -499,6 +519,14 @@ async function doStreamImpl(
   }
 
   const systemPrompt = extractSystemPrompt(callOptions.prompt)
+  const sessionKey = opencodeSessionKey(callOptions)
+  const compactionOption = devinOpts?.[DEVIN_COMPACTION_OPTION]
+  const isCompaction = compactionOption === true || (
+    compactionOption === undefined && isCompactionSession(sessionKey)
+  )
+  const workspaceRoot = path.resolve(
+    getSessionDirectory(sessionKey) ?? options.workspaceRoot ?? (callOptions as any).workspaceRoot ?? process.cwd(),
+  )
   let messages = extractHistory(callOptions.prompt)
   if (attachmentExtraction?.attachments.length) {
     messages = injectAttachmentsOntoLastUser(
@@ -506,9 +534,8 @@ async function doStreamImpl(
       attachmentExtraction.attachments.map(attachmentToContentPart),
     )
   }
-  const tools = extractTools(callOptions)
-  const workspaceRoot = options.workspaceRoot ?? (callOptions as any).workspaceRoot ?? process.cwd()
-  const guidance = buildDevinOpenCodeGuidance(tools, workspaceRoot)
+  const tools = isCompaction ? [] : extractTools(callOptions)
+  const guidance = isCompaction ? undefined : buildDevinOpenCodeGuidance(tools, workspaceRoot)
   if (guidance) {
     const sys = systemPrompt ? `${guidance}\n\n${systemPrompt}` : guidance
     messages = [{ role: "system", content: sys }, ...messages]
@@ -517,7 +544,6 @@ async function doStreamImpl(
     messages = [{ role: "system", content: systemPrompt }, ...messages]
   }
 
-  const sessionKey = opencodeSessionKey(callOptions)
   const cascadeId = sessionKey ?? crypto.randomUUID()
   const promptCacheKey = sessionKey ?? cascadeId
 
@@ -620,7 +646,7 @@ async function doStreamImpl(
       // native write/edit calls into apply_patch patches. Keyed off the
       // advertised catalog, not the model id — inert on OpenCode 2.0 and when
       // edit/write are available normally.
-      const advertisedNames = new Set(tools.map(t => t.name))
+      const advertisedNames = advertisedToolNames(tools)
       const schemaOf = (name: string) => tools.find(t => t.name === name)?.parameters
       const needsPatch = !advertisedNames.has("edit") && !advertisedNames.has("write") && advertisedNames.has("apply_patch")
       if (needsPatch) {
@@ -630,10 +656,9 @@ async function doStreamImpl(
         let toolName = tc.name
         let inputStr: string
         let refused: { reason: string; originalTool: string } | null = null
+        let parsed: unknown
+        try { parsed = JSON.parse(tc.args) } catch { parsed = tc.args }
         if (needsPatch && (toolName === "write" || toolName === "edit")) {
-          let parsed: unknown
-          try { parsed = JSON.parse(tc.args) } catch { parsed = tc.args }
-          const workspaceRoot = options.workspaceRoot ?? (callOptions as any).workspaceRoot ?? process.cwd()
           const remapped = remapDevinEditForApplyPatchCatalog({
             toolName,
             input: parsed,
@@ -650,19 +675,23 @@ async function doStreamImpl(
             trace(`devin apply_patch bridge refused ${toolName}: ${remapped.reason}`)
             refused = { reason: remapped.reason, originalTool: remapped.originalTool }
           } else {
-            const normalized = normalizeFileToolArgs(toolName, parsed, schemaOf(toolName))
+            const emitted = remapEmittedToolCall(toolName, parsed, advertisedNames)
+            toolName = emitted.toolName
+            const normalized = normalizeFileToolArgs(toolName, emitted.args, schemaOf(toolName))
             inputStr = typeof normalized === "string" ? normalized : JSON.stringify(normalized)
             controller.enqueue({ type: "tool-call", toolCallId: tc.id, toolName, input: inputStr } as unknown as LanguageModelV3StreamPart)
             continue
           }
         } else {
-          let parsed: unknown
-          try { parsed = JSON.parse(tc.args) } catch { parsed = tc.args }
-          const normalized = normalizeFileToolArgs(toolName, parsed, schemaOf(toolName))
+          const emitted = remapEmittedToolCall(toolName, parsed, advertisedNames)
+          toolName = emitted.toolName
+          const normalized = normalizeFileToolArgs(toolName, emitted.args, schemaOf(toolName))
           try {
             const before = typeof parsed === "string" ? parsed : JSON.stringify(parsed)
             const after = typeof normalized === "string" ? normalized : JSON.stringify(normalized)
-            if (before !== after) trace(`devin arg normalize ${toolName}: ${before.slice(0, 200)} -> ${after.slice(0, 200)}`)
+            if (before !== after || tc.name !== toolName) {
+              trace(`devin arg normalize ${tc.name}->${toolName}: ${before.slice(0, 200)} -> ${after.slice(0, 200)}`)
+            }
           } catch {}
           inputStr = typeof normalized === "string" ? normalized : JSON.stringify(normalized)
           controller.enqueue({ type: "tool-call", toolCallId: tc.id, toolName, input: inputStr } as unknown as LanguageModelV3StreamPart)

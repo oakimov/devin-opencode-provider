@@ -17,4 +17,11 @@ describe("plugin-opencode2 module", () => {
     const mod = await import("../src/plugin-opencode2.js")
     expect(mod).toBeDefined()
   })
+
+  it("dual-exports setup and the classic server", async () => {
+    const mod = await import("../src/plugin-opencode2.js")
+    expect(mod.default.id).toBe("devin.provider")
+    expect(typeof mod.default.setup).toBe("function")
+    expect(typeof mod.default.server).toBe("function")
+  })
 })

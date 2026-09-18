@@ -16,6 +16,10 @@ export const FALLBACK_CLIENT_VERSION = "windsurf-1.0.0"
 export const DEVIN_PROVIDER_ID = "devin"
 export const WINDSURF_PROVIDER_ID = "windsurf"
 export const PRIMARY_PROVIDER_ID = DEVIN_PROVIDER_ID
+/** Private provider option injected by the OpenCode plugin for summary turns. */
+export const DEVIN_COMPACTION_OPTION = "opencodeCompaction"
+/** Current OpenCode primary agent; used to tag request-local generation options. */
+export const DEVIN_HOST_AGENT_OPTION = "opencodeHostAgent"
 
 /** Keep alias for backwards compat — Windsurf rebranded to Devin Desktop */
 export const COMPATIBLE_PROVIDER_IDS = [DEVIN_PROVIDER_ID, WINDSURF_PROVIDER_ID, "cognition"]

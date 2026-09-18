@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 import * as zlib from "node:zlib"
@@ -488,13 +489,24 @@ async function fetchDevinModels(accessToken: string, opts: { baseURL?: string; s
 
 const refreshesByDirectory = new Map<string, Promise<ModelInfo[]>>()
 
+/** Short, non-reversible scope so two accounts sharing a cache dir do not share one refresh. */
+export function modelRefreshAccountKey(accessToken: string): string {
+  return createHash("sha256").update(accessToken).digest("hex").slice(0, 16)
+}
+
 export async function refreshModelCache(
   cacheDir: string,
   fetcher: () => Promise<ModelInfo[]>,
+  options: { forceAfterInflight?: boolean; accountKey?: string } = {},
 ): Promise<ModelInfo[]> {
-  const key = path.resolve(cacheDir)
+  const key = options.accountKey
+    ? `${path.resolve(cacheDir)}\0${options.accountKey}`
+    : path.resolve(cacheDir)
   const existing = refreshesByDirectory.get(key)
-  if (existing) return existing
+  if (existing) {
+    if (!options.forceAfterInflight) return existing
+    await existing.catch(() => {})
+  }
   const refresh = (async () => {
     const models = await fetcher()
     if (!models.length) {
@@ -523,13 +535,22 @@ export async function fetchModels(
  * Mirrors cursor provider: fresh cache → serve immediately + background refresh;
  * stale cache → try refresh, serve stale on failure; no cache → must fetch.
  */
-export async function discoverModels(accessToken: string, cacheDir: string, opts: { baseURL?: string; signal?: AbortSignal } = {}): Promise<ModelInfo[]> {
+export async function discoverModels(
+  accessToken: string,
+  cacheDir: string,
+  opts: { baseURL?: string; signal?: AbortSignal; forceRefresh?: boolean } = {},
+): Promise<ModelInfo[]> {
+  const { forceRefresh = false, ...fetchOptions } = opts
   const cached = await readCache(cacheDir)
-  const fetcher = () => fetchDevinModels(accessToken, opts)
+  const fetcher = () => fetchDevinModels(accessToken, fetchOptions)
+  const refresh = () => refreshModelCache(cacheDir, fetcher, {
+    forceAfterInflight: forceRefresh,
+    accountKey: modelRefreshAccountKey(accessToken),
+  })
 
   // Fresh → serve immediately, refresh in background (fire-and-forget)
-  if (cached && isCacheFresh(cached)) {
-    void refreshModelCache(cacheDir, fetcher).catch(() => {})
+  if (!forceRefresh && cached && isCacheFresh(cached)) {
+    void refresh().catch(() => {})
     trace(`discoverModels: serving fresh cache ${cached.models.length} models, background refresh started`)
     return cached.models
   }
@@ -537,17 +558,18 @@ export async function discoverModels(accessToken: string, cacheDir: string, opts
   // Stale but present → try refresh, fall back to stale on failure
   if (cached) {
     try {
-      const models = await refreshModelCache(cacheDir, fetcher)
+      const models = await refresh()
       trace(`discoverModels: refreshed stale cache -> ${models.length} models`)
       return models
     } catch (e) {
+      if (forceRefresh) throw e
       trace(`discoverModels: refresh failed, serving stale ${cached.models.length} models: ${(e as Error).message}`)
       return cached.models
     }
   }
 
   // No cache → must fetch (throws on failure)
-  const models = await refreshModelCache(cacheDir, fetcher)
+  const models = await refresh()
   trace(`discoverModels: initial fetch -> ${models.length} models`)
   return models
 }

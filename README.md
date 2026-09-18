@@ -14,7 +14,7 @@ OpenCode driving a Devin-routed model through this provider:
 
 ## Features
 
-- **OpenCode integration** — registers a `devin` provider with auth hooks and cached model list
+- **OpenCode integration** — registers a `devin` provider with auth hooks and cached model list (classic 1.x plugin, plus a dedicated [OpenCode 2.0](docs/opencode-2.md) entry)
 - **Authentication** — browser OAuth (PKCE), or API key from [devin.ai/settings](https://devin.ai/settings)
 - **Model discovery** — fetches available models from Devin's API and caches them locally
 - **Streaming** — bidirectional Connect-RPC chat with token usage tracking
@@ -208,9 +208,12 @@ OpenCode
 | Import path | Export |
 |-------------|--------|
 | `devin-opencode-provider` | `createDevin`, `DevinPlugin` (named + default) |
-| `devin-opencode-provider/plugin` | `DevinPlugin` (classic Hooks — auth) |
+| `devin-opencode-provider/plugin` | `DevinPlugin` (classic OpenCode 1.x Hooks) |
+| `devin-opencode-provider/plugin/v2` | OpenCode 1.18 Promise v2 plugin |
+| `devin-opencode-provider/plugin/opencode2` | OpenCode 2.0 plugin (`{ id, setup, server }`) |
+| `devin-opencode-provider/server` | Same module as `plugin/opencode2` (Host.resolve) |
 
-The package root intentionally stays plugin-safe for OpenCode's classic loader.
+The package root intentionally stays plugin-safe for OpenCode's classic loader. OpenCode 2.0: see [docs/opencode-2.md](docs/opencode-2.md).
 
 ## Troubleshooting
 

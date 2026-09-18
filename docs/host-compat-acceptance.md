@@ -11,6 +11,7 @@ This provider is designed to work with OpenCode and compatible coding agents.
 
 - AI SDK LanguageModelV3 interface
 - Plugin hooks for auth and model discovery
+- OpenCode 2.0: `exports["./plugin/opencode2"]` / `exports["./server"]` with `provider.transform` + `editor.add`
 - Streaming support
 - Tool call support
 
