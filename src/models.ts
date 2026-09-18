@@ -491,6 +491,8 @@ const refreshesByDirectory = new Map<string, Promise<ModelInfo[]>>()
 
 /** Short, non-reversible scope so two accounts sharing a cache dir do not share one refresh. */
 export function modelRefreshAccountKey(accessToken: string): string {
+  // codeql[js/insufficient-password-hash] -- The token is a high-entropy JWT/API key,
+  // and this digest is only an ephemeral in-memory dedup scope, never a password verifier.
   return createHash("sha256").update(accessToken).digest("hex").slice(0, 16)
 }
 
