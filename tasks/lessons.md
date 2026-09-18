@@ -27,6 +27,7 @@ This directory contains development notes and lessons learned during development
 - **Max ≠ Cursor Max Mode**: Devin has no `max_mode` toggle; Max is `effort=max`. Cursor Max Mode ≈ long-context / `max_mode` wire flag
 
 ### Plugin / OpenCode host
+- OpenCode 2.0 inventory is `ctx.provider.transform` + `editor.add` + `sourceConnection`, not `ctx.catalog`. Dual-export `{ id, setup, server: DevinPlugin }` on `./plugin/opencode2` and `./server`. Plugin `todowrite`/`todoread` stay off unless `DEVIN_OPENCODE2_TODOS=1`/`true`. Do not advertise `devin_image_save` on 2.0 (public `ToolContext` cannot request permissions). Extra classic hooks (`tool.execute.*`, `shell.env`, `chat.params`) drop `Hooks` contextual typing in this facade — annotate parameters or the whole return object goes implicit-any.
 - Always assign `existing.models = modelsToConfig(...)` on config load (Cursor does this). Skipping when `existing.models` is nonempty leaves a **stale** catalog in long-lived TUI sessions after rebuild
 - After `bun run build`, fully restart the TUI; CLI `opencode models` / a one-shot `modelsToConfig` dump can look correct while an old process still shows flat or wrong order
 - Older OpenCode TUI may have sorted variant titles with `localeCompare`; research trees sometimes comment that out — if CLI order is right but TUI isn’t, check host dialog sort before changing our insertion order again

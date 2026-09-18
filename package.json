@@ -1,6 +1,6 @@
 {
   "name": "devin-opencode-provider",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Use Devin/Windsurf subscription models from OpenCode via Windsurf's Connect-RPC Cascade protocol",
   "type": "module",
   "license": "MIT",
@@ -29,6 +29,18 @@
       "types": "./dist/plugin.d.ts",
       "import": "./dist/plugin.js"
     },
+    "./plugin/v2": {
+      "types": "./dist/plugin-v2.d.ts",
+      "import": "./dist/plugin-v2.js"
+    },
+    "./plugin/opencode2": {
+      "types": "./dist/plugin-opencode2.d.ts",
+      "import": "./dist/plugin-opencode2.js"
+    },
+    "./server": {
+      "types": "./dist/plugin-opencode2.d.ts",
+      "import": "./dist/plugin-opencode2.js"
+    },
     "./compat": {
       "types": "./dist/compat.d.ts",
       "import": "./dist/compat.js"
@@ -52,7 +64,7 @@
   ],
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
     "test": "bun test"
   },
   "dependencies": {

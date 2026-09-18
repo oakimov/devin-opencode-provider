@@ -49,6 +49,16 @@ const outcomes = new Map<string, DevinShellOutcome>()
 /** callIDs that need shell.env injectors or a direct-command fallback. */
 const pendingEnvWraps = new Set<string>()
 const activeEnvWraps = new Map<string, DevinShellEnvWrap>()
+/**
+ * Command text the host will actually observe for a pending wrap.
+ * Identical concurrent commands get a no-op suffix so `shell.create.before`
+ * can tell them apart without a tool-call id.
+ */
+const visibleCommands = new Map<string, string>()
+/** Timeout stamped onto tool args. Hosts that echo it disambiguate wraps. */
+const correlationTimeouts = new Map<string, number>()
+const CORRELATION_MODULUS = 997
+let correlationSeq = 0
 let configuredShell: string | undefined
 
 /** Track OpenCode's configured shell from the classic config hook. */
@@ -136,6 +146,30 @@ export function registerDevinShellCall(
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+function nextCorrelationOffset(): number {
+  correlationSeq = (correlationSeq % CORRELATION_MODULUS) + 1
+  return correlationSeq
+}
+
+function shellCorrelationMarker(toolCallId: string): string {
+  return `: ${shellQuote(`devin-shell:${toolCallId}`)}`
+}
+
+function commandHasCollision(toolCallId: string, command: string, workingDirectory: string): boolean {
+  for (const [id, policy] of policies) {
+    if (id === toolCallId || !pendingEnvWraps.has(id)) continue
+    if (policy.workingDirectory !== workingDirectory) continue
+    const visible = visibleCommands.get(id) ?? policy.command
+    if (visible === command || policy.command === command) return true
+  }
+  return false
+}
+
+function forgetShellCorrelation(toolCallId: string): void {
+  visibleCommands.delete(toolCallId)
+  correlationTimeouts.delete(toolCallId)
 }
 
 /**
@@ -298,7 +332,11 @@ export function prepareDevinShellArgs(
   if (!policy.backgroundSpawn) {
     // The wrapper returns just after Devin's foreground window. OpenCode's own
     // timeout is only an outer safety net and must not win the race.
-    args.timeout = Math.max(OPENCODE_TIMEOUT_GRACE_MS, policy.timeoutMs + OPENCODE_TIMEOUT_GRACE_MS)
+    // The extra 1..997ms is a correlation token for hosts that echo timeout
+    // into `shell.create.before` and have no tool-call id.
+    const timeoutMs = Math.max(OPENCODE_TIMEOUT_GRACE_MS, policy.timeoutMs + OPENCODE_TIMEOUT_GRACE_MS) + nextCorrelationOffset()
+    args.timeout = timeoutMs
+    correlationTimeouts.set(toolCallId, timeoutMs)
   }
 
   const shellKind = resolveDevinShellKind()
@@ -310,12 +348,24 @@ export function prepareDevinShellArgs(
   if (process.platform === "win32" || envInjectable) {
     // Native Windows PowerShell/cmd wrapping remains unsupported; do not emit
     // a POSIX /bin/sh command there. Git Bash still uses the env path above.
-    args.command = policy.command
+    let visible = policy.command
+    if (
+      process.platform !== "win32" &&
+      commandHasCollision(toolCallId, policy.command, policy.workingDirectory)
+    ) {
+      // Suffix, not prefix: the injector `exec`s the original policy command
+      // and never runs this line. If the injector is skipped, `:` is a no-op.
+      visible = `${policy.command}\n${shellCorrelationMarker(toolCallId)}`
+    }
+    args.command = visible
+    visibleCommands.set(toolCallId, visible)
     return
   }
 
   const wrap = ensureShellEnvWrap(toolCallId, policy)
-  if (wrap) args.command = `exec /bin/sh ${shellQuote(wrap.wrapperPath)}`
+  const visible = wrap ? `exec /bin/sh ${shellQuote(wrap.wrapperPath)}` : policy.command
+  if (wrap) args.command = visible
+  visibleCommands.set(toolCallId, visible)
 }
 
 /** Restore the model-facing command in OpenCode's completed tool title. */
@@ -326,6 +376,7 @@ export function devinShellOriginalCommand(toolCallId: string): string | undefine
 /** Drop injector temp files for a finished/abandoned Devin shell call. */
 export function releaseDevinShellEnv(toolCallId: string): void {
   pendingEnvWraps.delete(toolCallId)
+  forgetShellCorrelation(toolCallId)
   const active = activeEnvWraps.get(toolCallId)
   if (!active) return
   activeEnvWraps.delete(toolCallId)
@@ -344,6 +395,59 @@ export function devinShellEnvForCall(toolCallId: string | undefined): Record<str
   if (!wrap) return undefined
   pendingEnvWraps.delete(toolCallId)
   return wrap.env
+}
+
+/**
+ * OpenCode 2.0 `shell.create.before` has no tool-call id.
+ *
+ * Match a unique visible command first (collision suffixes), then a timeout
+ * the before-hook stamped, then command + working directory. If more than
+ * one pending wrap still matches, return nothing — assigning the wrong
+ * injector is worse than leaving the command unwrapped.
+ */
+export type DevinShellEnvHint = {
+  timeout?: number
+}
+
+function matchesObservedCommand(id: string, command: string): boolean {
+  if (visibleCommands.get(id) === command) return true
+  return policies.get(id)?.command === command
+}
+
+function matchesWorkingDirectory(id: string, workingDirectory: string | undefined): boolean {
+  if (!workingDirectory) return true
+  return policies.get(id)?.workingDirectory === workingDirectory
+}
+
+export function devinShellEnvForCommand(
+  command: string | undefined,
+  workingDirectory?: string,
+  hint?: DevinShellEnvHint,
+): Record<string, string> | undefined {
+  if (typeof command !== "string" || !command) return undefined
+  const pending = [...pendingEnvWraps].filter((id) => policies.has(id))
+  if (!pending.length) return undefined
+
+  if (typeof hint?.timeout === "number" && Number.isFinite(hint.timeout)) {
+    const byTimeout = pending.filter((id) =>
+      correlationTimeouts.get(id) === hint.timeout &&
+      matchesObservedCommand(id, command) &&
+      matchesWorkingDirectory(id, workingDirectory)
+    )
+    if (byTimeout.length === 1) return devinShellEnvForCall(byTimeout[0])
+  }
+
+  const exactVisible = pending.filter((id) =>
+    visibleCommands.get(id) === command && matchesWorkingDirectory(id, workingDirectory)
+  )
+  if (exactVisible.length === 1) return devinShellEnvForCall(exactVisible[0])
+  if (exactVisible.length > 1) return undefined
+
+  const byPolicy = pending.filter((id) =>
+    policies.get(id)?.command === command && matchesWorkingDirectory(id, workingDirectory)
+  )
+  if (byPolicy.length === 1) return devinShellEnvForCall(byPolicy[0])
+  return undefined
 }
 
 function withoutMarker(output: string, index: number): string {
@@ -559,12 +663,20 @@ export function consumeDevinShellResult(
   return { output: clean, outcome }
 }
 
-/** Test/process cleanup. */
-export function resetDevinShellCalls(): void {
+/** Drop in-flight shell tracking without forgetting the configured shell path. */
+export function clearDevinShellTracking(): void {
   for (const wrap of activeEnvWraps.values()) wrap.cleanup()
   activeEnvWraps.clear()
   pendingEnvWraps.clear()
   policies.clear()
   outcomes.clear()
+  visibleCommands.clear()
+  correlationTimeouts.clear()
+}
+
+/** Test/process cleanup. */
+export function resetDevinShellCalls(): void {
+  clearDevinShellTracking()
   configuredShell = undefined
+  correlationSeq = 0
 }

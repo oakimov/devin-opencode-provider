@@ -1,5 +1,6 @@
 import { DEVIN_PROVIDER_ID, PRIMARY_PROVIDER_ID, WINDSURF_API_HOST } from "./shared.js"
 import { createDevinLanguageModel } from "./language-model.js"
+import { setHostCacheDirOverride } from "./context/paths.js"
 import type { CreateDevinOptions } from "./index.js"
 
 export type DevinSdk = {
@@ -7,6 +8,7 @@ export type DevinSdk = {
 }
 
 export function createSdk(options: CreateDevinOptions): DevinSdk {
+  if (options.cacheDir) setHostCacheDirOverride(options.cacheDir)
   const providerId = options.name || PRIMARY_PROVIDER_ID
   return {
     languageModel(modelId: string) {

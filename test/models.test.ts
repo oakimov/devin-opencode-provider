@@ -12,6 +12,8 @@ import {
   resolveDevinWireModelId,
   wireModelIdFromBaseAndParams,
   extractDevinVariantParameters,
+  refreshModelCache,
+  modelRefreshAccountKey,
 } from "../src/models.js"
 import { MODEL_CACHE_SCHEMA_VERSION, MODEL_CACHE_TTL_MS } from "../src/shared.js"
 import type { ModelInfo } from "../src/models.js"
@@ -178,5 +180,80 @@ describe("extractDevinVariantParameters", () => {
 
   it("throws on malformed", () => {
     expect(() => extractDevinVariantParameters({ devinVariantParameters: [{ id: "effort", value: true as any }] })).toThrow()
+  })
+})
+
+describe("refreshModelCache account scope", () => {
+  it("does not reuse an in-flight refresh for a different account", async () => {
+    const dir = await tmpDir()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const model = (id: string): ModelInfo => ({ id, variants: [] })
+    const first = refreshModelCache(dir, async () => {
+      await gate
+      return [model("account-a")]
+    }, { accountKey: modelRefreshAccountKey("token-a") })
+    const second = refreshModelCache(dir, async () => [model("account-b")], {
+      accountKey: modelRefreshAccountKey("token-b"),
+    })
+    const gotSecond = await second
+    expect(gotSecond.map((entry) => entry.id)).toEqual(["account-b"])
+    release()
+    expect((await first).map((entry) => entry.id)).toEqual(["account-a"])
+  })
+
+  it("reuses an in-flight refresh for the same account", async () => {
+    const dir = await tmpDir()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let calls = 0
+    const model = (id: string): ModelInfo => ({ id, variants: [] })
+    const accountKey = modelRefreshAccountKey("token-a")
+    const first = refreshModelCache(dir, async () => {
+      calls++
+      await gate
+      return [model("shared")]
+    }, { accountKey })
+    const second = refreshModelCache(dir, async () => {
+      calls++
+      return [model("other")]
+    }, { accountKey })
+    expect(calls).toBe(1)
+    release()
+    expect((await first).map((entry) => entry.id)).toEqual(["shared"])
+    expect((await second).map((entry) => entry.id)).toEqual(["shared"])
+    expect(calls).toBe(1)
+  })
+
+  it("forceAfterInflight waits for the current refresh, then fetches again", async () => {
+    const dir = await tmpDir()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let calls = 0
+    const model = (id: string): ModelInfo => ({ id, variants: [] })
+    const accountKey = modelRefreshAccountKey("token-a")
+    const first = refreshModelCache(dir, async () => {
+      calls++
+      await gate
+      return [model("first")]
+    }, { accountKey })
+    let secondStarted = false
+    const second = refreshModelCache(dir, async () => {
+      secondStarted = true
+      calls++
+      return [model("second")]
+    }, { accountKey, forceAfterInflight: true })
+    expect(secondStarted).toBe(false)
+    expect(calls).toBe(1)
+    release()
+    expect((await second).map((entry) => entry.id)).toEqual(["second"])
+    expect((await first).map((entry) => entry.id)).toEqual(["first"])
+    expect(calls).toBe(2)
   })
 })

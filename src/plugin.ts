@@ -1,19 +1,70 @@
-import type { Hooks, PluginInput, Config } from "@opencode-ai/plugin"
+import path from "node:path"
+import { pathToFileURL } from "node:url"
+import type { Hooks, PluginInput, AuthOAuthResult, Config } from "@opencode-ai/plugin"
 import type { Auth } from "@opencode-ai/sdk"
-import { DEVIN_PROVIDER_ID, WINDSURF_PROVIDER_ID, DEVIN_WEBSITE_HOST, DEVIN_API_HOST } from "./shared.js"
+import {
+  DEVIN_PROVIDER_ID,
+  WINDSURF_PROVIDER_ID,
+  DEVIN_WEBSITE_HOST,
+  DEVIN_API_HOST,
+  DEVIN_COMPACTION_OPTION,
+  DEVIN_HOST_AGENT_OPTION,
+} from "./shared.js"
 import { devinApiBaseURL } from "./plugin-core.js"
-import { readCache, discoverModels, isCacheFresh } from "./models.js"
+import { readCache, discoverModels } from "./models.js"
 import { modelsToConfig } from "./model-config.js"
-import { opencodeGlobalCacheDir } from "./context/paths.js"
+export { modelInfoToConfig, modelsToConfig, thinkingSuffixBaseNames } from "./model-config.js"
+import { opencodeGlobalCacheDir, opencodeGlobalConfigDirs } from "./context/paths.js"
 import { readStoredAuth, type StoredAuth } from "./context/auth-store.js"
 import { getCachedUserJwt, createLoopbackServer, buildDevinLoginUrl, generatePkceParams, generatePkceChallenge, pollForDevinTokens, isExpiringSoon, decodeJwtExpiryMs } from "./auth.js"
 import { trace } from "./debug.js"
+import {
+  captureDevinShellResult,
+  devinShellEnvForCall,
+  devinShellOriginalCommand,
+  prepareDevinShellArgs,
+  releaseDevinShellEnv,
+  sanitizeRegisteredDevinShellOutput,
+  setDevinShellPath,
+} from "./shell-timeout.js"
+import { createOpenCodeWebSearchTool, classicToolFactoryFromModule, openCodeWebSearchTool } from "./web-search-tool.js"
 
 const MODULE_URL = new URL("./index.js", import.meta.url).href
+
+export async function loadClassicTools(options: {
+  importModule?: (specifier: string) => Promise<unknown>
+  configDirs?: string[]
+} = {}): Promise<{ webSearch: Record<string, unknown> }> {
+  const configDir = options.configDirs?.[0] ?? opencodeGlobalConfigDirs()[0]
+  const candidates = [
+    ...(configDir
+      ? [path.join(configDir, "node_modules", "@opencode-ai", "plugin", "dist", "index.js")]
+      : []),
+    "@opencode-ai/plugin",
+  ]
+  const importModule = options.importModule ?? ((specifier: string) => import(specifier))
+  for (const candidate of candidates) {
+    try {
+      const specifier = path.win32.isAbsolute(candidate) && !path.isAbsolute(candidate)
+        ? new URL(`file:///${candidate.replaceAll("\\", "/")}`).href
+        : path.isAbsolute(candidate)
+          ? pathToFileURL(candidate).href
+          : candidate
+      const module = await importModule(specifier)
+      const factory = classicToolFactoryFromModule(module)
+      if (!factory) continue
+      return { webSearch: createOpenCodeWebSearchTool(factory) }
+    } catch {
+      // Try the next host-owned/normal resolution location.
+    }
+  }
+  return { webSearch: openCodeWebSearchTool }
+}
 
 export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
   const cacheDir = opencodeGlobalCacheDir()
   const apiBaseURL = devinApiBaseURL()
+  const classicTools = await loadClassicTools()
 
   let sessionAccessToken: string | undefined
 
@@ -81,7 +132,84 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
   }
 
   return {
+    tool: {
+      // `websearch` is a reserved OpenCode id and is filtered for third-party
+      // providers after plugin tools are merged. Use the collision-safe id
+      // so this host-side fallback survives that filter. OpenCode 2.0 does
+      // not advertise this fallback: public ToolContext cannot request
+      // permission, so that entrypoint uses `ctx.websearch.transform`.
+      custom_websearch: classicTools.webSearch,
+    },
+
+    async "tool.execute.before"(
+      hookInput: { tool: string; callID: string },
+      output: { args: Record<string, unknown> },
+    ) {
+      if (hookInput.tool !== "bash" && hookInput.tool !== "shell") return
+      if (!output?.args || typeof output.args !== "object" || Array.isArray(output.args) || !Object.isExtensible(output.args)) return
+      prepareDevinShellArgs(hookInput.callID, output.args)
+    },
+
+    async "shell.env"(
+      hookInput: { callID: string },
+      output: { env: Record<string, string | undefined> },
+    ) {
+      const env = devinShellEnvForCall(hookInput.callID)
+      if (!env || !output || typeof output !== "object" || !Object.isExtensible(output)) return
+      if (!output.env || typeof output.env !== "object" || !Object.isExtensible(output.env)) {
+        output.env = { ...env }
+        return
+      }
+      Object.assign(output.env, env)
+    },
+
+    async "tool.execute.after"(
+      hookInput: { tool: string; callID: string },
+      output: { title?: string; output: string; metadata?: Record<string, unknown> },
+    ) {
+      if (hookInput.tool !== "bash" && hookInput.tool !== "shell") return
+      try {
+        if (!output || typeof output !== "object" || !Object.isExtensible(output)) return
+        if (typeof output.title === "string" || output.title === undefined) {
+          output.title = devinShellOriginalCommand(hookInput.callID) ?? output.title
+        }
+        if (typeof output.output === "string") {
+          output.output = captureDevinShellResult(
+            hookInput.callID,
+            output.output,
+            output.metadata && typeof output.metadata === "object" ? output.metadata : undefined,
+          )
+        }
+        if (output.metadata && typeof output.metadata === "object" && Object.isExtensible(output.metadata)) {
+          const metadata = output.metadata as Record<string, unknown>
+          if (typeof metadata.output === "string") {
+            metadata.output = sanitizeRegisteredDevinShellOutput(hookInput.callID, metadata.output)
+          }
+        }
+      } finally {
+        releaseDevinShellEnv(hookInput.callID)
+      }
+    },
+
+    async "chat.params"(
+      hookInput: { model: { providerID: string }; agent: string },
+      output: { options: Record<string, unknown> },
+    ) {
+      if (hookInput.model.providerID !== DEVIN_PROVIDER_ID && hookInput.model.providerID !== WINDSURF_PROVIDER_ID) return
+      if (!output || typeof output !== "object") return
+      if (output.options === undefined) {
+        if (!Object.isExtensible(output)) return
+        output.options = {}
+      }
+      if (!output.options || typeof output.options !== "object" || Array.isArray(output.options) || !Object.isExtensible(output.options)) return
+      output.options[DEVIN_HOST_AGENT_OPTION] = hookInput.agent
+      if (hookInput.agent === "compaction") {
+        output.options[DEVIN_COMPACTION_OPTION] = true
+      }
+    },
+
     async config(cfg: Config) {
+      setDevinShellPath((cfg as Config & { shell?: string }).shell)
       cfg.provider ??= {}
       const models = await loadModels()
       for (const pid of [DEVIN_PROVIDER_ID, WINDSURF_PROVIDER_ID]) {
@@ -112,7 +240,7 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
         {
           type: "oauth",
           label: "Devin account (browser login) — PKCE via api.devin.ai",
-          async authorize(): Promise<import("@opencode-ai/plugin").AuthOAuthResult> {
+          async authorize(): Promise<AuthOAuthResult> {
             const pkce = generatePkceParams()
             const challenge = await generatePkceChallenge(pkce.verifier)
             const state = pkce.uuid
@@ -167,7 +295,7 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
               },
             },
           ],
-          async authorize(inputs) {
+          async authorize(inputs: Record<string, string> | undefined) {
             const apiKey = (inputs as Record<string, string> | undefined)?.apiKey
             if (!apiKey) return { type: "failed" }
             // Validate by minting a user_jwt
@@ -180,7 +308,7 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
           },
         },
       ],
-      async loader(getAuth) {
+      async loader(getAuth: () => Promise<Auth | undefined>) {
         const auth = await authForLoader(getAuth as () => Promise<Auth | undefined>)
         const accessToken = (auth ? await resolveAccessToken(auth) : undefined) ?? sessionAccessToken ?? (process.env.DEVIN_API_KEY ?? process.env.WINDSURF_API_KEY)
         if (accessToken) {

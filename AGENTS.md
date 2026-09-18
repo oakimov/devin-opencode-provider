@@ -32,6 +32,7 @@ Devin exposes **flat** `model_uid`s. We group them **display-name-first** into o
 - **Context tier**: `-1m` stays a **separate base** (`claude-opus-4-6` vs `claude-opus-4-6-1m`), not a Max Mode flag.
 - **Reasoning**: `reasoning: true` if any group member supports thinking or exposes thinking/effort variants.
 - **Plugin**: always overwrites `cfg.provider.devin.models` on config load (do not keep a stale first merge).
+- **OpenCode 2.0**: load `devin-opencode-provider/plugin/opencode2` (dual-export `{ id, setup, server: DevinPlugin }`). Models publish via `ctx.provider.transform` + `editor.remove` (when present) + `editor.add` + `sourceConnection`. A failed credential switch clears the previous inventory. Plugin todos stay off unless `DEVIN_OPENCODE2_TODOS=1`/`true` and, when on, are in-memory only. Do not advertise `devin_image_save` on 2.0.
 
 There is **no Cursor-style Max Mode** toggle; **Max** = high effort only.
 ## Cache behavior
