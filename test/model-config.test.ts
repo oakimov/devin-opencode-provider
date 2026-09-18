@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "bun:test"
 import { modelsToConfig, thinkingSuffixBaseNames, modelInfoToConfig } from "../src/model-config.js"
-import { clearDevinWireIdAliases, resolveDevinWireModelId, type ModelInfo } from "../src/models.js"
+import { clearDevinWireIdAliases, registerDevinWireIdAlias, resolveDevinWireModelId, type ModelInfo } from "../src/models.js"
 
 function makeModel(overrides: Partial<ModelInfo> & { id: string }): ModelInfo {
   return {
@@ -88,7 +88,11 @@ describe("modelInfoToConfig", () => {
 })
 
 describe("modelsToConfig grouping", () => {
-  beforeEach(() => clearDevinWireIdAliases())
+  beforeEach(() => {
+    // Plan-filtered catalogs hide most uids. Live discovery tests must see them.
+    process.env.DEVIN_PROVIDER_SHOW_DISABLED = "1"
+    clearDevinWireIdAliases()
+  })
 
   it("groups flat ids into one base with parameter-only variants", () => {
     const models: ModelInfo[] = [
@@ -210,5 +214,31 @@ describe("modelsToConfig grouping", () => {
     expect(cfg["swe-1-7"]).toBeDefined()
     const params = (cfg["swe-1-7"].variants["Max Fast"] as any).devinVariantParameters
     expect(params).toEqual(expect.arrayContaining([{ id: "effort", value: "max" }, { id: "fast", value: "true" }]))
+  })
+
+  it("resolves a bare base to the catalog default wire id, not a guessed -medium", () => {
+    modelsToConfig([
+      makeModel({ id: "swe-2-low", displayName: "SWE-2 Low" }),
+      makeModel({ id: "swe-2-medium", displayName: "SWE-2 Medium" }),
+    ])
+    expect(resolveDevinWireModelId(undefined, "swe-2")).toBe("swe-2-low")
+  })
+
+  it("resolves a bare PRIVATE base to the alias uid", () => {
+    modelsToConfig([
+      makeModel({ id: "MODEL_PRIVATE_2", displayName: "Claude Sonnet 4.5" }),
+      makeModel({ id: "MODEL_PRIVATE_3", displayName: "Claude Sonnet 4.5 Thinking" }),
+    ])
+    expect(resolveDevinWireModelId(undefined, "claude-sonnet-4-5")).toBe("MODEL_PRIVATE_2")
+  })
+
+  it("uses a registered medium alias uid when the empty-params default is absent", () => {
+    registerDevinWireIdAlias("claude-sonnet-4-5", [{ id: "effort", value: "medium" }], "MODEL_PRIVATE_9")
+    expect(resolveDevinWireModelId(undefined, "claude-sonnet-4-5")).toBe("MODEL_PRIVATE_9")
+  })
+
+  it("does not invent -medium when the alias table is empty", () => {
+    expect(resolveDevinWireModelId(undefined, "swe-2")).toBe("swe-2")
+    expect(resolveDevinWireModelId(undefined, "claude-sonnet-5")).toBe("claude-sonnet-5")
   })
 })

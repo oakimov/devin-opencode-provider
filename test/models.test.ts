@@ -16,6 +16,10 @@ import {
 import { MODEL_CACHE_SCHEMA_VERSION, MODEL_CACHE_TTL_MS } from "../src/shared.js"
 import type { ModelInfo } from "../src/models.js"
 
+// Plan filtering hides most cascade models unless this is set. Any test that
+// discovers or refreshes the catalog must see disabled uids too.
+process.env.DEVIN_PROVIDER_SHOW_DISABLED = "1"
+
 const tmpDirs: string[] = []
 async function tmpDir() {
   const d = await fs.mkdtemp(path.join(os.tmpdir(), "devin-models-"))

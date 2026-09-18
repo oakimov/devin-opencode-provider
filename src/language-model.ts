@@ -99,7 +99,13 @@ export function extractHistory(prompt: LanguageModelV3CallOptions["prompt"]): Ch
         thinking = thoughts.join("\n")
       }
       const legacyToolCalls = (m as any).toolCalls as Array<{ toolCallId: string; toolName: string; input: unknown }> | undefined
-      const merged = [...(legacyToolCalls ?? []), ...inlineToolCalls]
+      const merged: Array<{ toolCallId: string; toolName: string; input: unknown }> = []
+      const seenCallIds = new Set<string>()
+      for (const tc of [...(legacyToolCalls ?? []), ...inlineToolCalls]) {
+        if (!tc.toolCallId || seenCallIds.has(tc.toolCallId)) continue
+        seenCallIds.add(tc.toolCallId)
+        merged.push(tc)
+      }
       const item: ChatHistoryItem = {
         role: "assistant",
         content: text,
@@ -109,25 +115,33 @@ export function extractHistory(prompt: LanguageModelV3CallOptions["prompt"]): Ch
       out.push(item)
     } else if ((m as any).role === "tool") {
       const raw = m as unknown as { role: "tool"; toolCallId?: string; toolName?: string; name?: string; result?: unknown; content?: unknown; output?: unknown }
-      // AI SDK v3 / OpenCode shape: tool results live inside tool.content[]
-      // as { type: "tool-result", toolCallId, output } (issue #1). The legacy
-      // flat { toolCallId, result/content/output } shape is kept for back-compat.
-      let toolCallId = raw.toolCallId
-      let result: unknown = (raw as any).result ?? (raw as any).output
+      // AI SDK v3 / OpenCode 1.x and 2.0: one tool message can carry several
+      // { type: "tool-result", toolCallId, toolName, output } parts. Emit one
+      // history item per part so parallel calls stay paired. Legacy flat
+      // { toolCallId, result/content/output } stays one item.
       const c = (raw as any).content
-      if (Array.isArray(c)) {
-        const part = (c as any[]).find(p => p && typeof p === "object" && (p as any).type === "tool-result") as any
-        if (part) {
-          if (!toolCallId && typeof part.toolCallId === "string") toolCallId = part.toolCallId
-          result = part.output ?? part.result ?? part.value ?? result
-        } else if ((raw as any).result === undefined && (raw as any).output === undefined) {
-          result = c
+      const parts = Array.isArray(c)
+        ? (c as any[]).filter(p => p && typeof p === "object" && (p as any).type === "tool-result")
+        : []
+      if (parts.length) {
+        for (const part of parts) {
+          const toolCallId = typeof part.toolCallId === "string" ? part.toolCallId : raw.toolCallId
+          const toolName = typeof part.toolName === "string" ? part.toolName : raw.toolName ?? raw.name
+          const result = part.output ?? part.result ?? part.value
+          out.push({
+            role: "tool",
+            content: toolResultToText({ toolName, result: result ?? "" }),
+            tool_call_id: toolCallId,
+          })
         }
-      } else if (c !== undefined && (raw as any).result === undefined && (raw as any).output === undefined) {
-        result = c
+      } else {
+        const result = (raw as any).result ?? (raw as any).output ?? (c !== undefined ? c : raw)
+        out.push({
+          role: "tool",
+          content: toolResultToText({ toolName: raw.toolName ?? raw.name, result }),
+          tool_call_id: raw.toolCallId,
+        })
       }
-      const text = toolResultToText({ toolName: raw.toolName ?? raw.name, result: result ?? raw })
-      out.push({ role: "tool", content: text, tool_call_id: toolCallId })
     }
   }
   return out
@@ -237,26 +251,33 @@ function unwrapOpencodeReadOutput(text: string): string {
   return footer ? `${content}\n\n${footer}` : content
 }
 
-function toolResultToText(m: unknown): string {
-  const tr = m as Record<string, unknown>
-  const raw = (tr as any).result ?? (tr as any).content ?? tr
-  if (typeof raw === "string") {
-    // Unwrap read envelope when this tool result came from `read`
-    const name = typeof (tr as any).toolName === "string" ? ((tr as any).toolName as string) : typeof (tr as any).name === "string" ? ((tr as any).name as string) : ""
-    if (name === "read" || name === "opencode-read" || name.includes("read")) {
-      return unwrapOpencodeReadOutput(raw)
-    }
-    return raw
-  }
+function toolOutputToString(raw: unknown): string {
+  if (typeof raw === "string") return raw
   if (raw && typeof raw === "object") {
     const o = raw as Record<string, unknown>
     if (o.type === "text" || o.type === "error-text") return String(o.value ?? "")
     if (o.type === "json" || o.type === "error-json") return JSON.stringify(o.value ?? null)
+    if (o.type === "execution-denied") {
+      return typeof o.reason === "string" && o.reason ? o.reason : "execution denied"
+    }
     if (o.type === "content" && Array.isArray(o.value)) {
       return (o.value as Array<Record<string, unknown>>).map(c => c.type === "text" ? String(c.text ?? "") : "").join("")
     }
   }
   try { return JSON.stringify(raw ?? "") } catch { return String(raw ?? "") }
+}
+
+function toolResultToText(m: unknown): string {
+  const tr = m as Record<string, unknown>
+  const raw = (tr as any).result ?? (tr as any).content ?? tr
+  const text = toolOutputToString(raw)
+  // Unwrap read envelope when this tool result came from `read`.
+  // v3 puts toolName on the part; the text may be `{ type: "text", value }`.
+  const name = typeof (tr as any).toolName === "string" ? ((tr as any).toolName as string) : typeof (tr as any).name === "string" ? ((tr as any).name as string) : ""
+  if (name === "read" || name === "opencode-read" || name.includes("read")) {
+    return unwrapOpencodeReadOutput(text)
+  }
+  return text
 }
 
 export function buildDevinOpenCodeGuidance(tools: ToolDef[], workspaceRoot: string): string | undefined {
@@ -391,16 +412,19 @@ async function doStreamImpl(
   })()
   // OpenCode id is the base (`claude-opus-5`); Devin wire uid is synthesized
   // from variant params (`claude-opus-5-medium`). Matches Cursor's one-id shape.
-  // Prime the alias table from the model cache so bare base ids (e.g. `swe-2`)
-  // resolve to their default variant even when OpenCode sends no params.
-  // Fire-and-forget is fine: resolveDevinWireModelId falls back to synthesis.
+  // Prime the alias table from the model cache so a bare base id resolves to the
+  // catalog default wire uid (including opaque PRIVATE_* ids) when the host
+  // sends no variant params. Both OpenCode 1.x config and 2.0 inventory already
+  // call modelsToConfig; this covers SDK use before that runs.
   try {
     const { readCache } = await import("./models.js")
     const { modelsToConfig } = await import("./model-config.js")
     const { opencodeGlobalCacheDir } = await import("./context/paths.js")
     const _c = await readCache(options.cacheDir ?? opencodeGlobalCacheDir())
     if (_c?.models.length) modelsToConfig(_c.models)
-  } catch {}
+  } catch (e) {
+    trace(`devin wire-id alias prime failed: ${(e as Error).message}`)
+  }
   const wireModelId = resolveDevinWireModelId(devinOpts, modelId, picked)
   if (picked || wireModelId !== modelId) {
     trace(`devin variant: opencodeId=${modelId} wireId=${wireModelId} picked=${picked ? JSON.stringify(picked) : "none"}`)

@@ -167,7 +167,7 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
               },
             },
           ],
-          async authorize(inputs) {
+          async authorize(inputs: Record<string, string> | undefined) {
             const apiKey = (inputs as Record<string, string> | undefined)?.apiKey
             if (!apiKey) return { type: "failed" }
             // Validate by minting a user_jwt
@@ -180,7 +180,7 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
           },
         },
       ],
-      async loader(getAuth) {
+      async loader(getAuth: () => Promise<Auth | undefined>) {
         const auth = await authForLoader(getAuth as () => Promise<Auth | undefined>)
         const accessToken = (auth ? await resolveAccessToken(auth) : undefined) ?? sessionAccessToken ?? (process.env.DEVIN_API_KEY ?? process.env.WINDSURF_API_KEY)
         if (accessToken) {

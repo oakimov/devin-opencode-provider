@@ -127,4 +127,25 @@ describe("buildGetChatMessageRequest 3.9.19 wire fields", () => {
     const req = buildGetChatMessageRequest({ ...base, messages: msgs })
     expect(nestedMessages(req).length).toBe(1)
   })
+
+  it("drops assistant tool calls that have no result", () => {
+    const msgs: ChatHistoryItem[] = [
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        content: "calling",
+        tool_calls: [
+          { id: "keep", name: "read", arguments: "{}" },
+          { id: "drop", name: "bash", arguments: "{}" },
+        ],
+      },
+      { role: "tool", content: "ok", tool_call_id: "keep" },
+    ]
+    const prompts = nestedMessages(buildGetChatMessageRequest({ ...base, messages: msgs }))
+    expect(prompts.length).toBe(3)
+    const calls = [...iterFields(prompts[1]!)].filter((f) => f.num === 6 && f.wire === 2 && f.value instanceof Uint8Array)
+    expect(calls.length).toBe(1)
+    const id = [...iterFields(calls[0]!.value as Uint8Array)].find((f) => f.num === 1 && f.wire === 2)
+    expect(new TextDecoder().decode(id!.value as Uint8Array)).toBe("keep")
+  })
 })

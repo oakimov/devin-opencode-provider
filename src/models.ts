@@ -351,17 +351,15 @@ export function resolveDevinWireModelId(
   if (alias) return alias
   const synthesized = wireModelIdFromBaseAndParams(fallback, picked)
   if (synthesized !== fallback) return synthesized
-  // Bare base ids are display-only groupings (e.g. "swe-2" → "swe-2-medium").
-  // The Cascade backend rejects the bare id with permission_denied, so fall
-  // back to the catalog default variant instead of sending it raw.
-  // Only apply to known grouped bases (alias table populated by modelsToConfig
-  // or the swe family); unknown ids pass through unchanged for back-compat.
-  const knownGrouped =
-    lookupDevinWireIdAlias(fallback, []) !== undefined ||
-    lookupDevinWireIdAlias(fallback, [{ id: "effort", value: "medium" }]) !== undefined ||
-    /^(swe|swe-1|swe-2)/.test(fallback) ||
-    fallback === "claude-sonnet-5"
-  if (knownGrouped) return fallback + "-medium"
+  // Bare display id (no variant params, or params that add no suffix).
+  // The catalog default is the empty-params alias registered by modelsToConfig
+  // (lowest effort / No Thinking). Return that wire uid — it may be opaque.
+  // Never invent `${base}-medium`: that disagrees with the picker and misses
+  // PRIVATE_* aliases. Unknown ids with an empty alias table pass through.
+  const catalogDefault = lookupDevinWireIdAlias(fallback, [])
+  if (catalogDefault) return catalogDefault
+  const mediumAlias = lookupDevinWireIdAlias(fallback, [{ id: "effort", value: "medium" }])
+  if (mediumAlias) return mediumAlias
   return synthesized
 }
 

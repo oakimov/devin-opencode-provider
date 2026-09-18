@@ -142,6 +142,77 @@ describe("extractHistory AI SDK v3 tool-call shapes (issue #1)", () => {
     expect(sawId).toBe("call_ABC")
     expect(sawContent).toContain("1 match")
   })
+
+  it("keeps every tool-result part in one tool message", () => {
+    const prompt: LanguageModelV3CallOptions["prompt"] = [
+      { role: "user", content: [{ type: "text", text: "go" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "tool-call", toolCallId: "call_a", toolName: "read", input: { path: "/a" } },
+          { type: "tool-call", toolCallId: "call_b", toolName: "grep", input: { pattern: "x" } },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          { type: "tool-result", toolCallId: "call_a", toolName: "read", output: { type: "text", value: "one" } },
+          { type: "tool-result", toolCallId: "call_b", toolName: "grep", output: { type: "text", value: "two" } },
+        ],
+      },
+    ]
+    const items = extractHistory(prompt)
+    const tools = items.filter(i => i.role === "tool")
+    expect(tools.map(t => t.tool_call_id)).toEqual(["call_a", "call_b"])
+    expect(tools.map(t => t.content)).toEqual(["one", "two"])
+    const req = buildGetChatMessageRequest({ ...base, messages: items, tools: [] })
+    const ids: string[] = []
+    for (const f of iterFields(req)) {
+      if (f.num === 3 && f.wire === 2 && f.value instanceof Uint8Array) {
+        for (const sf of iterFields(f.value)) {
+          if (sf.num === 7 && sf.wire === 2 && sf.value instanceof Uint8Array) {
+            ids.push(new TextDecoder().decode(sf.value))
+          }
+        }
+      }
+    }
+    expect(ids).toEqual(["call_a", "call_b"])
+  })
+
+  it("unwraps read output using toolName on the v3 part", () => {
+    const prompt: LanguageModelV3CallOptions["prompt"] = [
+      { role: "user", content: [{ type: "text", text: "read it" }] },
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "call_r", toolName: "read", input: { path: "/tmp/a.txt" } }] },
+      {
+        role: "tool",
+        content: [{
+          type: "tool-result",
+          toolCallId: "call_r",
+          toolName: "read",
+          output: {
+            type: "text",
+            value: "<path>/tmp/a.txt</path><type>file</type><content>\n1: hello\n2: world\n</content>",
+          },
+        }],
+      },
+    ]
+    const tool = extractHistory(prompt).find(i => i.role === "tool")
+    expect(tool?.content).toBe("hello\nworld")
+    expect(String(tool?.content)).not.toContain("1: ")
+  })
+
+  it("renders execution-denied tool output as text", () => {
+    const prompt: LanguageModelV3CallOptions["prompt"] = [
+      { role: "user", content: [{ type: "text", text: "go" }] },
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "call_d", toolName: "bash", input: {} }] },
+      {
+        role: "tool",
+        content: [{ type: "tool-result", toolCallId: "call_d", toolName: "bash", output: { type: "execution-denied", reason: "user denied" } }],
+      },
+    ]
+    const tool = extractHistory(prompt).find(i => i.role === "tool")
+    expect(tool?.content).toBe("user denied")
+  })
 })
 
 

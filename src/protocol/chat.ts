@@ -151,33 +151,56 @@ function collapseSystemIntoUser(messages: ChatHistoryItem[]): ChatHistoryItem[] 
 }
 
 /**
- * Drop tool messages that have no matching assistant tool_call_id.
+ * Keep only tool calls and results that pair.
  *
- * When OpenCode aborts / compacts mid-turn, history can contain a tool result
- * whose assistant tool call never made it into the prompt (issue #1 follow-up).
- * The backend cannot pair an orphan tool message and fails the whole request
- * with `invalid_argument: an internal error occurred`, so we drop orphans and
- * let the turn continue as text instead of hard-failing every retry.
+ * OpenCode 1.x and 2.0 both replay history through this encoder. Abort and
+ * compaction can leave a tool result whose assistant call never landed, or a
+ * call whose result never landed. Either side makes Cascade fail the whole
+ * request with `invalid_argument`, so unpaired calls and results are dropped
+ * and the turn continues as text.
  */
 function dropOrphanToolMessages(messages: ChatHistoryItem[]): ChatHistoryItem[] {
-  const knownIds = new Set<string>()
+  const callIds = new Set<string>()
+  const resultIds = new Set<string>()
   for (const m of messages) {
     if (m.role === "assistant" && m.tool_calls) {
-      for (const tc of m.tool_calls) if (tc.id) knownIds.add(tc.id)
+      for (const tc of m.tool_calls) if (tc.id) callIds.add(tc.id)
+    } else if (m.role === "tool" && m.tool_call_id) {
+      resultIds.add(m.tool_call_id)
     }
   }
-  return messages.filter((m) => {
-    if (m.role !== "tool") return true
-    if (!m.tool_call_id) {
-      trace("dropOrphanToolMessages: dropping tool message without tool_call_id")
-      return false
+  const out: ChatHistoryItem[] = []
+  for (const m of messages) {
+    if (m.role === "tool") {
+      if (!m.tool_call_id) {
+        trace("dropOrphanToolMessages: dropping tool message without tool_call_id")
+        continue
+      }
+      if (!callIds.has(m.tool_call_id)) {
+        trace(`dropOrphanToolMessages: dropping orphan tool result ${m.tool_call_id.slice(0, 12)} (no matching assistant tool call)`)
+        continue
+      }
+      out.push(m)
+      continue
     }
-    if (!knownIds.has(m.tool_call_id)) {
-      trace(`dropOrphanToolMessages: dropping orphan tool result ${m.tool_call_id.slice(0, 12)} (no matching assistant tool call)`)
-      return false
+    if (m.role === "assistant" && m.tool_calls?.length) {
+      const kept = m.tool_calls.filter((tc) => tc.id && resultIds.has(tc.id))
+      if (kept.length !== m.tool_calls.length) {
+        trace(`dropOrphanToolMessages: dropping ${m.tool_calls.length - kept.length} assistant tool call(s) without a result`)
+      }
+      if (kept.length === 0) {
+        const { tool_calls: _dropped, ...rest } = m
+        out.push(rest)
+      } else if (kept.length !== m.tool_calls.length) {
+        out.push({ ...m, tool_calls: kept })
+      } else {
+        out.push(m)
+      }
+      continue
     }
-    return true
-  })
+    out.push(m)
+  }
+  return out
 }
 
 function encodeChatMessagePrompt(
