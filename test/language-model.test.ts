@@ -380,3 +380,63 @@ describe("tool description injection via extractTools (smoke)", () => {
     expect(guids(["todowrite", "todoread"])).toContain("`todowrite` / `todoread`")
   })
 })
+
+describe("extractHistory reasoning replay", () => {
+  const base = {
+    apiKey: "k",
+    userJwt: "jwt",
+    modelUid: "swe-2-medium",
+    cascadeId: "c",
+    promptId: "p1",
+    sessionId: "s",
+    requestId: 1n,
+    triggerId: "t",
+  }
+
+  it("maps assistant reasoning parts onto ChatMessagePrompt.#11, not visible text", () => {
+    const prompt: LanguageModelV3CallOptions["prompt"] = [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "I should greet the user" },
+          { type: "text", text: "Hello" },
+        ],
+      },
+    ]
+    const items = extractHistory(prompt)
+    const asst = items.find(i => i.role === "assistant")
+    expect(asst?.content).toBe("Hello")
+    expect(asst?.thinking).toBe("I should greet the user")
+
+    const req = buildGetChatMessageRequest({ ...base, messages: items, tools: [] })
+    let thinking: string | undefined
+    let text: string | undefined
+    for (const f of iterFields(req)) {
+      if (f.num !== 3 || f.wire !== 2 || !(f.value instanceof Uint8Array)) continue
+      for (const sf of iterFields(f.value)) {
+        if (sf.wire !== 2 || !(sf.value instanceof Uint8Array)) continue
+        const s = new TextDecoder().decode(sf.value)
+        if (sf.num === 3) text = s
+        else if (sf.num === 11) thinking = s
+      }
+    }
+    expect(text).toBe("Hello")
+    expect(thinking).toBe("I should greet the user")
+  })
+
+  it("strips in-band think tags from assistant text onto #11", () => {
+    const prompt: LanguageModelV3CallOptions["prompt"] = [
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "<think>plan</think></think>\nHello" }],
+      },
+    ]
+    const items = extractHistory(prompt)
+    const asst = items.find(i => i.role === "assistant")
+    expect(asst?.thinking).toBe("plan")
+    expect(asst?.content).toBe("\nHello")
+    expect(String(asst?.content)).not.toContain("</think>")
+  })
+})

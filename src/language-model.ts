@@ -30,6 +30,7 @@ import {
 import { DEVIN_COMPACTION_OPTION } from "./shared.js"
 import { isCompactionSession } from "./compaction-marker.js"
 import { getSessionDirectory } from "./session-directory.js"
+import { feedThinkTags, flushThinkTags, newThinkTagState, splitThinkDocument } from "./think-tags.js"
 
 /** OpenCode session id header, if present — used for cascade/prompt_cache_key affinity. */
 export function opencodeSessionKey(callOptions: LanguageModelV3CallOptions): string | undefined {
@@ -86,15 +87,28 @@ export function extractHistory(prompt: LanguageModelV3CallOptions["prompt"]): Ch
       let text = ""
       let thinking = ""
       const inlineToolCalls: Array<{ toolCallId: string; toolName: string; input: unknown }> = []
-      if (typeof c === "string") text = c
-      else if (Array.isArray(c)) {
+      if (typeof c === "string") {
+        const split = splitThinkDocument(c)
+        text = split.text
+        thinking = split.thinking
+      } else if (Array.isArray(c)) {
         const texts: string[] = []
         const thoughts: string[] = []
         for (const p of c as any[]) {
-          if (p.type === "text") texts.push(p.text)
-          else if (p.type === "reasoning" || p.type === "thinking") {
-            const t = typeof p.text === "string" ? p.text : typeof p.thinking === "string" ? p.thinking : ""
-            if (t) thoughts.push(t)
+          if (p.type === "text") {
+            const split = splitThinkDocument(typeof p.text === "string" ? p.text : "")
+            if (split.text) texts.push(split.text)
+            if (split.thinking) thoughts.push(split.thinking)
+          } else if (p.type === "reasoning" || p.type === "thinking") {
+            const t = typeof p.text === "string" ? p.text
+              : typeof p.thinking === "string" ? p.thinking
+              : typeof p.reasoning === "string" ? p.reasoning
+              : ""
+            if (t) {
+              const split = splitThinkDocument(t)
+              const body = [split.thinking, split.text].filter(Boolean).join("")
+              if (body) thoughts.push(body)
+            }
           } else if (p.type === "tool-call") {
             // AI SDK v3 / OpenCode shape: tool calls live inside
             // assistant.content[] (issue #1). The legacy m.toolCalls shape
@@ -552,15 +566,78 @@ async function doStreamImpl(
   const stream = new ReadableStream<LanguageModelV3StreamPart>({
     async start(controller) {
       controller.enqueue({ type: "stream-start", warnings: [] } as LanguageModelV3StreamPart)
-      let textId: string | undefined
-      let reasoningId: string | undefined
+      const textId = crypto.randomUUID()
+      let reasoningId = crypto.randomUUID()
+      let textStarted = false
+      let reasoningStarted = false
+      const thinkState = newThinkTagState()
       const toolCalls = new Map<string, { id: string; name: string; args: string }>()
+      const openToolInputs = new Set<string>()
       let finishUnified: LanguageModelV3Usage extends never ? string : "stop" | "tool-calls" | "length" | "content-filter" | "error" | "other" = "other" as any
       let rawFinish: string | undefined
       const counters: DevinUsageCounters = { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0 }
       let hasUsage = false
 
       const toFinishReason = (unified: string, raw?: string): any => ({ unified, raw })
+
+      /** AI SDK V3 requires text-end / reasoning-end before finish or tool-call. */
+      const closeOpenSpans = () => {
+        for (const part of spanEndParts({ textStarted, reasoningStarted, textId, reasoningId })) {
+          controller.enqueue(part as LanguageModelV3StreamPart)
+        }
+        reasoningStarted = false
+        textStarted = false
+      }
+
+      const emitText = (text: string) => {
+        if (!text) return
+        // Close reasoning before text (hosts expect reasoning-end before text-start).
+        if (reasoningStarted && !textStarted) {
+          controller.enqueue({ type: "reasoning-end", id: reasoningId } as LanguageModelV3StreamPart)
+          reasoningStarted = false
+        }
+        if (!textStarted) {
+          controller.enqueue({ type: "text-start", id: textId } as LanguageModelV3StreamPart)
+          textStarted = true
+        }
+        controller.enqueue({ type: "text-delta", id: textId, delta: text } as LanguageModelV3StreamPart)
+      }
+
+      const emitReasoning = (text: string) => {
+        if (!text) return
+        if (!reasoningStarted) {
+          reasoningId = crypto.randomUUID()
+          controller.enqueue({ type: "reasoning-start", id: reasoningId } as LanguageModelV3StreamPart)
+          reasoningStarted = true
+        }
+        controller.enqueue({ type: "reasoning-delta", id: reasoningId, delta: text } as LanguageModelV3StreamPart)
+      }
+
+      const ingestThinkEvents = (events: ReturnType<typeof feedThinkTags>, source: "text" | "reasoning") => {
+        for (const ev of events) {
+          if (source === "reasoning" || ev.kind === "reasoning") emitReasoning(ev.text)
+          else emitText(ev.text)
+        }
+      }
+
+      const flushThinkMarkup = () => {
+        ingestThinkEvents(flushThinkTags(thinkState), "text")
+      }
+
+      const endToolInput = (id: string) => {
+        if (!openToolInputs.has(id)) return
+        controller.enqueue({ type: "tool-input-end", id } as unknown as LanguageModelV3StreamPart)
+        openToolInputs.delete(id)
+      }
+
+      const closeToolInputs = () => {
+        for (const id of [...openToolInputs]) endToolInput(id)
+      }
+
+      const emitToolCall = (toolCallId: string, toolName: string, input: string) => {
+        endToolInput(toolCallId)
+        controller.enqueue({ type: "tool-call", toolCallId, toolName, input } as unknown as LanguageModelV3StreamPart)
+      }
 
       try {
         for await (const ev of streamChatEvents({
@@ -577,19 +654,14 @@ async function doStreamImpl(
         })) {
           if (callOptions.abortSignal?.aborted) break
           if (ev.kind === "text") {
-            if (!textId) {
-              textId = crypto.randomUUID()
-              controller.enqueue({ type: "text-start", id: textId } as LanguageModelV3StreamPart)
-            }
-            controller.enqueue({ type: "text-delta", id: textId, delta: ev.text } as LanguageModelV3StreamPart)
+            ingestThinkEvents(feedThinkTags(ev.text, thinkState), "text")
           } else if (ev.kind === "reasoning") {
-            if (!reasoningId) {
-              reasoningId = crypto.randomUUID()
-              controller.enqueue({ type: "reasoning-start", id: reasoningId } as LanguageModelV3StreamPart)
-            }
-            controller.enqueue({ type: "reasoning-delta", id: reasoningId, delta: ev.text } as LanguageModelV3StreamPart)
+            ingestThinkEvents(feedThinkTags(ev.text, thinkState), "reasoning")
           } else if (ev.kind === "tool_call_start") {
+            flushThinkMarkup()
+            closeOpenSpans()
             toolCalls.set(ev.id, { id: ev.id, name: ev.name, args: "" })
+            openToolInputs.add(ev.id)
             controller.enqueue({ type: "tool-input-start", id: ev.id, toolName: ev.name } as unknown as LanguageModelV3StreamPart)
           } else if (ev.kind === "tool_call_args") {
             const existing = toolCalls.get(ev.id ?? [...toolCalls.keys()].pop() ?? "")
@@ -622,25 +694,19 @@ async function doStreamImpl(
         trace(`devin doStream error model=${modelId} host=${host} code=${err.code ?? ""} transient=${String(err.transient ?? "")} error=${err.message} stack=${String((err as any).stack ?? "").slice(0, 800)}`)
         // For quota errors, surface the server message as visible text so the user sees
         // the exact quota/trace ID instead of OpenCode's generic "Provider is overloaded [retrying...]"
-        if (isQuota) {
-          if (!textId) {
-            textId = crypto.randomUUID()
-            controller.enqueue({ type: "text-start", id: textId } as LanguageModelV3StreamPart)
-          }
-          const quotaMsg = `⚠️ Devin quota exhausted: ${err.message}`
-          controller.enqueue({ type: "text-delta", id: textId, delta: quotaMsg } as LanguageModelV3StreamPart)
-        }
+        flushThinkMarkup()
+        if (isQuota) emitText(`⚠️ Devin quota exhausted: ${err.message}`)
+        closeOpenSpans()
+        closeToolInputs()
         controller.enqueue({ type: "error", error: err } as LanguageModelV3StreamPart)
-        if (textId) controller.enqueue({ type: "text-end", id: textId } as LanguageModelV3StreamPart)
-        if (reasoningId) controller.enqueue({ type: "reasoning-end", id: reasoningId } as LanguageModelV3StreamPart)
         const errUsage = hasUsage ? buildLanguageModelV3UsageFromCounters(counters) : emptyLanguageModelV3Usage()
         controller.enqueue({ type: "finish", finishReason: toFinishReason("error", err.message), usage: errUsage, providerMetadata: { devin: { error: err.message } } } as unknown as LanguageModelV3StreamPart)
         controller.close()
         return
       }
 
-      if (textId) controller.enqueue({ type: "text-end", id: textId } as LanguageModelV3StreamPart)
-      if (reasoningId) controller.enqueue({ type: "reasoning-end", id: reasoningId } as LanguageModelV3StreamPart)
+      flushThinkMarkup()
+      closeOpenSpans()
       // For GPT models where OpenCode swaps edit/write for apply_patch (see
       // src/protocol/apply-patch.ts header / opencode PR #9127), translate Devin's
       // native write/edit calls into apply_patch patches. Keyed off the
@@ -669,7 +735,7 @@ async function doStreamImpl(
             toolName = "apply_patch"
             inputStr = JSON.stringify({ patchText: remapped.patchText })
             trace(`devin apply_patch bridge: ${remapped.originalTool} -> apply_patch ${remapped.filePath}`)
-            controller.enqueue({ type: "tool-call", toolCallId: tc.id, toolName, input: inputStr } as unknown as LanguageModelV3StreamPart)
+            emitToolCall(tc.id, toolName, inputStr)
             continue
           } else if (remapped.type === "refused") {
             trace(`devin apply_patch bridge refused ${toolName}: ${remapped.reason}`)
@@ -679,7 +745,7 @@ async function doStreamImpl(
             toolName = emitted.toolName
             const normalized = normalizeFileToolArgs(toolName, emitted.args, schemaOf(toolName))
             inputStr = typeof normalized === "string" ? normalized : JSON.stringify(normalized)
-            controller.enqueue({ type: "tool-call", toolCallId: tc.id, toolName, input: inputStr } as unknown as LanguageModelV3StreamPart)
+            emitToolCall(tc.id, toolName, inputStr)
             continue
           }
         } else {
@@ -694,22 +760,22 @@ async function doStreamImpl(
             }
           } catch {}
           inputStr = typeof normalized === "string" ? normalized : JSON.stringify(normalized)
-          controller.enqueue({ type: "tool-call", toolCallId: tc.id, toolName, input: inputStr } as unknown as LanguageModelV3StreamPart)
+          emitToolCall(tc.id, toolName, inputStr)
           continue
         }
         if (refused) {
           const errMsg = `Devin ${refused.originalTool} request cannot be expressed as an apply_patch call: ${refused.reason}. The host advertises \`apply_patch\` instead of \`edit\`/\`write\` for this model.`
-          // Emit as apply_patch so OpenCode surfaces a typed error; also warn in text
-          controller.enqueue({ type: "tool-call", toolCallId: tc.id, toolName: "apply_patch", input: JSON.stringify({ patchText: `*** Begin Patch\n*** Update File: ${errMsg}\n*** End Patch` }) } as unknown as LanguageModelV3StreamPart)
-          if (!textId) {
-            textId = crypto.randomUUID()
-            controller.enqueue({ type: "text-start", id: textId } as LanguageModelV3StreamPart)
-          }
-          controller.enqueue({ type: "text-delta", id: textId, delta: `\n\n⚠️ ${errMsg}\n` } as LanguageModelV3StreamPart)
-          // keep textId open to be closed by outer finalizer
+          // Emit as apply_patch so OpenCode surfaces a typed error; also warn in a
+          // fully closed text span (the main assistant spans already ended).
+          emitToolCall(tc.id, "apply_patch", JSON.stringify({ patchText: `*** Begin Patch\n*** Update File: ${errMsg}\n*** End Patch` }))
+          const warnId = crypto.randomUUID()
+          controller.enqueue({ type: "text-start", id: warnId } as LanguageModelV3StreamPart)
+          controller.enqueue({ type: "text-delta", id: warnId, delta: `\n\n⚠️ ${errMsg}\n` } as LanguageModelV3StreamPart)
+          controller.enqueue({ type: "text-end", id: warnId } as LanguageModelV3StreamPart)
         }
       }
 
+      closeToolInputs()
       if ((finishUnified as string) === "other") finishUnified = (toolCalls.size > 0 ? "tool-calls" : "stop") as any
       const finalUsage = hasUsage ? buildLanguageModelV3UsageFromCounters(counters) : emptyLanguageModelV3Usage()
       // Like cursor's LoggableUsage, expose raw server counters verbatim in providerMetadata
@@ -736,6 +802,7 @@ async function doStreamImpl(
 
 function foldStreamParts(parts: LanguageModelV3StreamPart[]): LanguageModelV3GenerateResult {
   let text = ""
+  let reasoning = ""
   const toolCalls: Array<{ toolCallId: string; toolName: string; input: string }> = []
   let finishReason: LanguageModelV3GenerateResult["finishReason"] = { unified: "stop", raw: undefined }
   let usage: LanguageModelV3GenerateResult["usage"] = {
@@ -745,6 +812,7 @@ function foldStreamParts(parts: LanguageModelV3StreamPart[]): LanguageModelV3Gen
   for (const p of parts) {
     const part = p as unknown as Record<string, unknown>
     if (part.type === "text-delta" && typeof part.delta === "string") text += part.delta
+    if (part.type === "reasoning-delta" && typeof part.delta === "string") reasoning += part.delta
     if (part.type === "tool-call") {
       const input = typeof part.input === "string" ? part.input : JSON.stringify(part.input ?? "")
       toolCalls.push({ toolCallId: part.toolCallId as string, toolName: part.toolName as string, input })
@@ -756,6 +824,7 @@ function foldStreamParts(parts: LanguageModelV3StreamPart[]): LanguageModelV3Gen
   }
   return {
     content: [
+      ...(reasoning ? [{ type: "reasoning" as const, text: reasoning }] : []),
       ...(text ? [{ type: "text" as const, text }] : []),
       ...toolCalls.map(tc => ({ type: "tool-call" as const, toolCallId: tc.toolCallId, toolName: tc.toolName, input: tc.input })),
     ],
@@ -763,4 +832,17 @@ function foldStreamParts(parts: LanguageModelV3StreamPart[]): LanguageModelV3Gen
     usage,
     warnings: [],
   }
+}
+
+/** AI SDK V3 requires text-end / reasoning-end before finish or tool-call. */
+export function spanEndParts(opts: {
+  textStarted: boolean
+  reasoningStarted: boolean
+  textId: string
+  reasoningId: string
+}): Array<{ type: "text-end" | "reasoning-end"; id: string }> {
+  const out: Array<{ type: "text-end" | "reasoning-end"; id: string }> = []
+  if (opts.reasoningStarted) out.push({ type: "reasoning-end", id: opts.reasoningId })
+  if (opts.textStarted) out.push({ type: "text-end", id: opts.textId })
+  return out
 }

@@ -320,7 +320,7 @@ export function buildGetChatMessageRequest(args: BuildArgs): Uint8Array {
   )
 }
 
-function* decodeChatFrame(proto: Uint8Array): Generator<CloudChatEvent> {
+export function* decodeChatFrame(proto: Uint8Array): Generator<CloudChatEvent> {
   for (const f of iterFields(proto)) {
     if (f.num === 3 && f.wire === 2 && f.value instanceof Uint8Array) {
       const s = new TextDecoder().decode(f.value)

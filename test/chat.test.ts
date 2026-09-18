@@ -1,6 +1,7 @@
 import { describe, it, expect } from "bun:test"
 import { encodeMessage, encodeString, concat, iterFields } from "../src/protocol/wire.js"
 import { buildMetadata } from "../src/protocol/metadata.js"
+import { decodeChatFrame } from "../src/protocol/chat.js"
 
 describe("chat protocol encoding", () => {
   it("builds GetChatMessage-like request structure", () => {
@@ -46,5 +47,15 @@ describe("chat protocol encoding", () => {
     const combined = concat(...parts)
     const fields = iterFields(combined)
     expect(fields.length).toBe(3)
+  })
+})
+
+describe("decodeChatFrame thinking vs text", () => {
+  it("maps proto #9 to reasoning and #3 to text", () => {
+    const proto = concat(encodeString(9, "think first"), encodeString(3, "say this"))
+    expect([...decodeChatFrame(proto)]).toEqual([
+      { kind: "reasoning", text: "think first" },
+      { kind: "text", text: "say this" },
+    ])
   })
 })

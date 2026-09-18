@@ -59,6 +59,12 @@ This directory contains development notes and lessons learned during development
 - `control_type` on family metadata is CLI-picker-only; OpenCode variants still come from display-name peeling.
 - Inject extracted attachments onto the last user message — extraction alone is not enough.
 
+### Thinking / `</think>` leak (2026-09-19)
+- GetChatMessage `#9` is structured reasoning, `#3` is visible text (`docs` in the mock server). SWE/Qwen/Muse models still emit `<think>…</think>` **on #3**.
+- Closing reasoning before `text-start` is required (AI SDK V3) but does **not** strip the tags. Literal `</think>` in OpenCode is in-band markup on the text channel.
+- Split tags cross-chunk (`src/think-tags.ts`, same hold as `cursor_mock/llm/client.py _feed_think_tags`) and drop stray `</think>` with no open tag. Replay the inner body on history `#11`, never as `#3`.
+- Flush the hold buffer before tool-call / finish; reopen reasoning with a new span id after `</think>`.
+
 ### Empty model cache must not be "fresh" (2026-09-09)
 Schema bump + a failed/empty discovery wrote `devin-models.json` with
 `models: []` and a current `fetchedAt`. `isCacheFresh` treated it as valid
