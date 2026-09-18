@@ -301,13 +301,26 @@ function variantNameFromSuffix(suffix: string): string {
 }
 
 function slugifyModelLabel(label: string): string {
-  return label
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    // Two anchored passes instead of /^-+|-+$/ — the alternation backtracks
-    // polynomially on dash-heavy input (codeql js/polynomial-redos).
-    .replace(/^-+/, "")
-    .replace(/-+$/, "")
+  // Regex-free on purpose: the obvious /[^a-z0-9]+/g + trim patterns trip
+  // codeql js/polynomial-redos on dash/space-heavy labels. Single linear pass:
+  // alphanumerics verbatim, other runs collapsed to one "-", no edge dashes.
+  // Matches lower.replace(/[^a-z0-9]+/g, "-").replace(/^-+/, "").replace(/-+$/, "").
+  const lower = label.toLowerCase()
+  let out = ""
+  let lastWasDash = true // suppress leading dashes
+  for (const ch of lower) {
+    const code = ch.charCodeAt(0)
+    const alnum = (code >= 97 && code <= 122) || (code >= 48 && code <= 57)
+    if (alnum) {
+      out += ch
+      lastWasDash = false
+    } else if (!lastWasDash) {
+      out += "-"
+      lastWasDash = true
+    }
+  }
+  if (lastWasDash && out.endsWith("-")) out = out.slice(0, -1)
+  return out
 }
 
 function titleCaseVariantPhrase(phrase: string): string {
