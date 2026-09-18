@@ -15,7 +15,7 @@ import {
   hostShellTool,
   remapEmittedToolCall,
 } from "./protocol/host-dialect.js"
-import { extractDevinVariantParameters, resolveDevinWireModelId } from "./models.js"
+import { extractDevinVariantParameters, lookupDevinWireIdAlias, resolveDevinWireModelId } from "./models.js"
 import {
   resolveDevinModelSupportsDocuments,
   resolveDevinModelSupportsImages,
@@ -53,7 +53,8 @@ function extractSystemPrompt(prompt: LanguageModelV3CallOptions["prompt"]): stri
   return sys || undefined
 }
 
-function extractHistory(prompt: LanguageModelV3CallOptions["prompt"]): ChatHistoryItem[] {
+/** Exported for issue #1 round-trip tests (AI SDK v3 tool-call shapes). */
+export function extractHistory(prompt: LanguageModelV3CallOptions["prompt"]): ChatHistoryItem[] {
   const out: ChatHistoryItem[] = []
   for (const m of prompt) {
     if (m.role === "system") continue
@@ -84,6 +85,7 @@ function extractHistory(prompt: LanguageModelV3CallOptions["prompt"]): ChatHisto
       const c = (m as any).content
       let text = ""
       let thinking = ""
+      const inlineToolCalls: Array<{ toolCallId: string; toolName: string; input: unknown }> = []
       if (typeof c === "string") text = c
       else if (Array.isArray(c)) {
         const texts: string[] = []
@@ -93,23 +95,73 @@ function extractHistory(prompt: LanguageModelV3CallOptions["prompt"]): ChatHisto
           else if (p.type === "reasoning" || p.type === "thinking") {
             const t = typeof p.text === "string" ? p.text : typeof p.thinking === "string" ? p.thinking : ""
             if (t) thoughts.push(t)
+          } else if (p.type === "tool-call") {
+            // AI SDK v3 / OpenCode shape: tool calls live inside
+            // assistant.content[] (issue #1). The legacy m.toolCalls shape
+            // below is kept for back-compat.
+            if (typeof p.toolCallId === "string" && typeof p.toolName === "string") {
+              inlineToolCalls.push({ toolCallId: p.toolCallId, toolName: p.toolName, input: (p as any).input ?? (p as any).args ?? {} })
+            }
           }
         }
         text = texts.join("\n")
         thinking = thoughts.join("\n")
       }
-      const toolCalls = (m as any).toolCalls as Array<{ toolCallId: string; toolName: string; input: unknown }> | undefined
+      const legacyToolCalls = (m as any).toolCalls as Array<{ toolCallId: string; toolName: string; input: unknown }> | undefined
+      const merged: Array<{ toolCallId: string; toolName: string; input: unknown }> = []
+      const seenCallIds = new Set<string>()
+      for (const tc of [...(legacyToolCalls ?? []), ...inlineToolCalls]) {
+        if (!tc.toolCallId || seenCallIds.has(tc.toolCallId)) continue
+        seenCallIds.add(tc.toolCallId)
+        merged.push(tc)
+      }
       const item: ChatHistoryItem = {
         role: "assistant",
         content: text,
-        tool_calls: toolCalls?.map(tc => ({ id: tc.toolCallId, name: tc.toolName, arguments: JSON.stringify(tc.input ?? {}) })),
+        tool_calls: merged.length ? merged.map(tc => ({ id: tc.toolCallId, name: tc.toolName, arguments: typeof tc.input === "string" ? tc.input : JSON.stringify(tc.input ?? {}) })) : undefined,
       }
       if (thinking) item.thinking = thinking
       out.push(item)
     } else if ((m as any).role === "tool") {
-      const raw = m as unknown as { role: "tool"; toolCallId: string; toolName?: string; name?: string; result?: unknown; content?: unknown; output?: unknown }
-      const text = toolResultToText({ toolName: raw.toolName ?? raw.name, result: raw.result ?? raw.content ?? raw.output ?? raw })
-      out.push({ role: "tool", content: text, tool_call_id: raw.toolCallId })
+      const raw = m as unknown as { role: "tool"; toolCallId?: string; toolName?: string; name?: string; result?: unknown; content?: unknown; output?: unknown }
+      // AI SDK v3 / OpenCode 1.x and 2.0: one tool message can carry several
+      // { type: "tool-result", toolCallId, toolName, output } parts. Emit one
+      // history item per part so parallel calls stay paired. Legacy flat
+      // { toolCallId, result/content/output } stays one item.
+      const c = (raw as any).content
+      const parts = Array.isArray(c)
+        ? (c as any[]).filter(p => p && typeof p === "object" && (p as any).type === "tool-result")
+        : []
+      if (parts.length) {
+        // Hosts only send tool-result parts, but if stray text parts ride along
+        // in the same message, keep them: unpaired text has no tool_call_id and
+        // would be dropped downstream, so fold it into the first item.
+        const stray: string[] = []
+        for (const p of c as any[]) {
+          if (p && typeof p === "object" && (p as any).type === "text" && typeof (p as any).text === "string") {
+            stray.push((p as any).text)
+          }
+        }
+        parts.forEach((part, i) => {
+          const toolCallId = typeof part.toolCallId === "string" ? part.toolCallId : raw.toolCallId
+          const toolName = typeof part.toolName === "string" ? part.toolName : raw.toolName ?? raw.name
+          const result = part.output ?? part.result ?? part.value
+          let content = toolResultToText({ toolName, result: result ?? "" })
+          if (i === 0 && stray.length) content = [...stray, content].filter(Boolean).join("\n")
+          out.push({
+            role: "tool",
+            content,
+            tool_call_id: toolCallId,
+          })
+        })
+      } else {
+        const result = (raw as any).result ?? (raw as any).output ?? (c !== undefined ? c : raw)
+        out.push({
+          role: "tool",
+          content: toolResultToText({ toolName: raw.toolName ?? raw.name, result }),
+          tool_call_id: raw.toolCallId,
+        })
+      }
     }
   }
   return out
@@ -219,26 +271,40 @@ function unwrapOpencodeReadOutput(text: string): string {
   return footer ? `${content}\n\n${footer}` : content
 }
 
-function toolResultToText(m: unknown): string {
-  const tr = m as Record<string, unknown>
-  const raw = (tr as any).result ?? (tr as any).content ?? tr
-  if (typeof raw === "string") {
-    // Unwrap read envelope when this tool result came from `read`
-    const name = typeof (tr as any).toolName === "string" ? ((tr as any).toolName as string) : typeof (tr as any).name === "string" ? ((tr as any).name as string) : ""
-    if (name === "read" || name === "opencode-read" || name.includes("read")) {
-      return unwrapOpencodeReadOutput(raw)
-    }
-    return raw
-  }
+function toolOutputToString(raw: unknown): string {
+  if (typeof raw === "string") return raw
   if (raw && typeof raw === "object") {
     const o = raw as Record<string, unknown>
     if (o.type === "text" || o.type === "error-text") return String(o.value ?? "")
     if (o.type === "json" || o.type === "error-json") return JSON.stringify(o.value ?? null)
+    if (o.type === "execution-denied") {
+      return typeof o.reason === "string" && o.reason ? o.reason : "execution denied"
+    }
     if (o.type === "content" && Array.isArray(o.value)) {
       return (o.value as Array<Record<string, unknown>>).map(c => c.type === "text" ? String(c.text ?? "") : "").join("")
     }
   }
   try { return JSON.stringify(raw ?? "") } catch { return String(raw ?? "") }
+}
+
+/** True for the file-read tool only — matched as a whole segment so tools like
+ * `thread`, `todoread`, or `spreadsheet` never get their output unwrapped. */
+function isReadToolName(name: string): boolean {
+  if (name === "read" || name === "opencode-read") return true
+  return /(^|[-_:/])read([-_:/]|$)/i.test(name)
+}
+
+function toolResultToText(m: unknown): string {
+  const tr = m as Record<string, unknown>
+  const raw = (tr as any).result ?? (tr as any).content ?? tr
+  const text = toolOutputToString(raw)
+  // Unwrap read envelope when this tool result came from `read`.
+  // v3 puts toolName on the part; the text may be `{ type: "text", value }`.
+  const name = typeof (tr as any).toolName === "string" ? ((tr as any).toolName as string) : typeof (tr as any).name === "string" ? ((tr as any).name as string) : ""
+  if (isReadToolName(name)) {
+    return unwrapOpencodeReadOutput(text)
+  }
+  return text
 }
 
 export function buildDevinOpenCodeGuidance(tools: ToolDef[], workspaceRoot: string): string | undefined {
@@ -347,6 +413,11 @@ export function createDevinLanguageModel(
   }
 }
 
+// Alias-table prime state for doStreamImpl (see below). Module-level so every
+// stream in the process shares it: one cache-file read, then the loader owns
+// refreshes from there.
+let wireAliasPrimed = false
+
 async function doStreamImpl(
   modelId: string,
   options: CreateDevinOptions,
@@ -384,6 +455,31 @@ async function doStreamImpl(
   })()
   // OpenCode id is the base (`claude-opus-5`); Devin wire uid is synthesized
   // from variant params (`claude-opus-5-medium`). Matches Cursor's one-id shape.
+  // Prime the alias table from the model cache so a bare base id resolves to the
+  // catalog default wire uid (including opaque PRIVATE_* ids) when the host
+  // sends no variant params. Both OpenCode 1.x config and 2.0 inventory already
+  // call modelsToConfig; this covers SDK use before that runs. Prime at most
+  // once, and never clobber a populated table: after a credential switch the
+  // on-disk cache may still hold the previous account, while the loader has
+  // already rebuilt aliases for the new one.
+  if (!wireAliasPrimed) {
+    if (lookupDevinWireIdAlias(modelId, picked) !== undefined || lookupDevinWireIdAlias(modelId, []) !== undefined) {
+      wireAliasPrimed = true
+    } else {
+      try {
+        const { readCache } = await import("./models.js")
+        const { modelsToConfig } = await import("./model-config.js")
+        const { opencodeGlobalCacheDir } = await import("./context/paths.js")
+        const _c = await readCache(options.cacheDir ?? opencodeGlobalCacheDir())
+        if (_c?.models.length) {
+          modelsToConfig(_c.models)
+          wireAliasPrimed = true
+        }
+      } catch (e) {
+        trace(`devin wire-id alias prime failed: ${(e as Error).message}`)
+      }
+    }
+  }
   const wireModelId = resolveDevinWireModelId(devinOpts, modelId, picked)
   if (picked || wireModelId !== modelId) {
     trace(`devin variant: opencodeId=${modelId} wireId=${wireModelId} picked=${picked ? JSON.stringify(picked) : "none"}`)

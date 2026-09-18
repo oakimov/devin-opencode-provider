@@ -87,4 +87,93 @@ describe("buildGetChatMessageRequest 3.9.19 wire fields", () => {
     expect(thinking).toBeTruthy()
     expect(new TextDecoder().decode(thinking!.value as Uint8Array)).toBe("need to reason")
   })
+
+  it("keeps paired tool call + result (issue #1)", () => {
+    const msgs: ChatHistoryItem[] = [
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        content: "calling",
+        tool_calls: [{ id: "toolu_123", name: "read", arguments: '{"path":"/tmp"}' }],
+      },
+      { role: "tool", content: "file list ok", tool_call_id: "toolu_123" },
+    ]
+    const req = buildGetChatMessageRequest({ ...base, messages: msgs })
+    const prompts = nestedMessages(req)
+    // user + assistant + tool = 3 prompts (nothing dropped)
+    expect(prompts.length).toBe(3)
+    const toolPrompt = prompts[2]!
+    const fields = [...iterFields(toolPrompt)]
+    const idField = fields.find((f) => f.num === 7 && f.wire === 2)
+    expect(idField).toBeTruthy()
+    expect(new TextDecoder().decode(idField!.value as Uint8Array)).toBe("toolu_123")
+  })
+
+  it("drops orphan tool result without id (issue #1 follow-up)", () => {
+    const msgs: ChatHistoryItem[] = [
+      { role: "user", content: "hi" },
+      { role: "tool", content: "orphan" },
+    ]
+    const req = buildGetChatMessageRequest({ ...base, messages: msgs })
+    // only the user prompt survives
+    expect(nestedMessages(req).length).toBe(1)
+  })
+
+  it("drops orphan tool result with unmatched id (issue #1 follow-up)", () => {
+    const msgs: ChatHistoryItem[] = [
+      { role: "user", content: "hi" },
+      { role: "tool", content: "orphan", tool_call_id: "toolu_999" },
+    ]
+    const req = buildGetChatMessageRequest({ ...base, messages: msgs })
+    expect(nestedMessages(req).length).toBe(1)
+  })
+
+  it("drops assistant tool calls that have no result", () => {
+    const msgs: ChatHistoryItem[] = [
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        content: "calling",
+        tool_calls: [
+          { id: "keep", name: "read", arguments: "{}" },
+          { id: "drop", name: "bash", arguments: "{}" },
+        ],
+      },
+      { role: "tool", content: "ok", tool_call_id: "keep" },
+    ]
+    const prompts = nestedMessages(buildGetChatMessageRequest({ ...base, messages: msgs }))
+    expect(prompts.length).toBe(3)
+    const calls = [...iterFields(prompts[1]!)].filter((f) => f.num === 6 && f.wire === 2 && f.value instanceof Uint8Array)
+    expect(calls.length).toBe(1)
+    const id = [...iterFields(calls[0]!.value as Uint8Array)].find((f) => f.num === 1 && f.wire === 2)
+    expect(new TextDecoder().decode(id!.value as Uint8Array)).toBe("keep")
+  })
+
+  it("drops an assistant message left empty after orphan call removal", () => {
+    const msgs: ChatHistoryItem[] = [
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "orphan", name: "bash", arguments: "{}" }],
+      },
+    ]
+    const req = buildGetChatMessageRequest({ ...base, messages: msgs })
+    // only the user prompt survives — no blank assistant shell
+    expect(nestedMessages(req).length).toBe(1)
+  })
+
+  it("keeps thinking-only assistant messages after orphan call removal", () => {
+    const msgs: ChatHistoryItem[] = [
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        content: "",
+        thinking: "still reasoning",
+        tool_calls: [{ id: "orphan", name: "bash", arguments: "{}" }],
+      },
+    ]
+    const req = buildGetChatMessageRequest({ ...base, messages: msgs })
+    expect(nestedMessages(req).length).toBe(2)
+  })
 })

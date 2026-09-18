@@ -150,6 +150,68 @@ function collapseSystemIntoUser(messages: ChatHistoryItem[]): ChatHistoryItem[] 
   return out
 }
 
+/**
+ * Keep only tool calls and results that pair.
+ *
+ * OpenCode 1.x and 2.0 both replay history through this encoder. Abort and
+ * compaction can leave a tool result whose assistant call never landed, or a
+ * call whose result never landed. Either side makes Cascade fail the whole
+ * request with `invalid_argument`, so unpaired calls and results are dropped
+ * and the turn continues as text.
+ */
+function dropOrphanToolMessages(messages: ChatHistoryItem[]): ChatHistoryItem[] {
+  const callIds = new Set<string>()
+  const resultIds = new Set<string>()
+  for (const m of messages) {
+    if (m.role === "assistant" && m.tool_calls) {
+      for (const tc of m.tool_calls) if (tc.id) callIds.add(tc.id)
+    } else if (m.role === "tool" && m.tool_call_id) {
+      resultIds.add(m.tool_call_id)
+    }
+  }
+  const out: ChatHistoryItem[] = []
+  for (const m of messages) {
+    if (m.role === "tool") {
+      if (!m.tool_call_id) {
+        trace("dropOrphanToolMessages: dropping tool message without tool_call_id")
+        continue
+      }
+      if (!callIds.has(m.tool_call_id)) {
+        trace(`dropOrphanToolMessages: dropping orphan tool result ${m.tool_call_id.slice(0, 12)} (no matching assistant tool call)`)
+        continue
+      }
+      out.push(m)
+      continue
+    }
+    if (m.role === "assistant" && m.tool_calls?.length) {
+      const kept = m.tool_calls.filter((tc) => tc.id && resultIds.has(tc.id))
+      if (kept.length !== m.tool_calls.length) {
+        trace(`dropOrphanToolMessages: dropping ${m.tool_calls.length - kept.length} assistant tool call(s) without a result`)
+      }
+      if (kept.length === 0) {
+        const { tool_calls: _dropped, ...rest } = m
+        // No text and no thinking left either — drop the empty shell instead of
+        // sending a blank assistant prompt.
+        const c = rest.content
+        const hasText = typeof c === "string" ? c.trim().length > 0 : Array.isArray(c) ? c.length > 0 : true
+        const hasThinking = typeof rest.thinking === "string" ? rest.thinking.trim().length > 0 : false
+        if (!hasText && !hasThinking) {
+          trace("dropOrphanToolMessages: dropping assistant message left empty after orphan call removal")
+          continue
+        }
+        out.push(rest)
+      } else if (kept.length !== m.tool_calls.length) {
+        out.push({ ...m, tool_calls: kept })
+      } else {
+        out.push(m)
+      }
+      continue
+    }
+    out.push(m)
+  }
+  return out
+}
+
 function encodeChatMessagePrompt(
   content: ContentPart[],
   source: number,
@@ -230,7 +292,7 @@ type BuildArgs = {
 
 export function buildGetChatMessageRequest(args: BuildArgs): Uint8Array {
   const metadata = buildMetadata({ apiKey: args.apiKey, userJwt: args.userJwt, sessionId: args.sessionId, requestId: args.requestId, triggerId: args.triggerId })
-  const collapsed = collapseSystemIntoUser(args.messages)
+  const collapsed = dropOrphanToolMessages(collapseSystemIntoUser(args.messages))
   const promptParts = collapsed.map(m => encodeMessage(3, encodeChatMessagePrompt(
     normalizeContent(m.content),
     SOURCE_BY_ROLE[m.role] ?? 1,

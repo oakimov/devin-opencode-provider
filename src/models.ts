@@ -350,7 +350,18 @@ export function resolveDevinWireModelId(
   // Opaque PRIVATE_* (and any future non-synthesizable) mappings win over suffix synthesis.
   const alias = lookupDevinWireIdAlias(fallback, picked)
   if (alias) return alias
-  return wireModelIdFromBaseAndParams(fallback, picked)
+  const synthesized = wireModelIdFromBaseAndParams(fallback, picked)
+  if (synthesized !== fallback) return synthesized
+  // Bare display id (no variant params, or params that add no suffix).
+  // The catalog default is the empty-params alias registered by modelsToConfig
+  // (lowest effort / No Thinking). Return that wire uid — it may be opaque.
+  // Never invent `${base}-medium`: that disagrees with the picker and misses
+  // PRIVATE_* aliases. Unknown ids with an empty alias table pass through.
+  const catalogDefault = lookupDevinWireIdAlias(fallback, [])
+  if (catalogDefault) return catalogDefault
+  const mediumAlias = lookupDevinWireIdAlias(fallback, [{ id: "effort", value: "medium" }])
+  if (mediumAlias) return mediumAlias
+  return synthesized
 }
 
 export type ModelCache = {
