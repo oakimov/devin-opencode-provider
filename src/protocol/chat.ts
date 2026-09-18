@@ -190,6 +190,15 @@ function dropOrphanToolMessages(messages: ChatHistoryItem[]): ChatHistoryItem[] 
       }
       if (kept.length === 0) {
         const { tool_calls: _dropped, ...rest } = m
+        // No text and no thinking left either — drop the empty shell instead of
+        // sending a blank assistant prompt.
+        const c = rest.content
+        const hasText = typeof c === "string" ? c.trim().length > 0 : Array.isArray(c) ? c.length > 0 : true
+        const hasThinking = typeof rest.thinking === "string" ? rest.thinking.trim().length > 0 : false
+        if (!hasText && !hasThinking) {
+          trace("dropOrphanToolMessages: dropping assistant message left empty after orphan call removal")
+          continue
+        }
         out.push(rest)
       } else if (kept.length !== m.tool_calls.length) {
         out.push({ ...m, tool_calls: kept })

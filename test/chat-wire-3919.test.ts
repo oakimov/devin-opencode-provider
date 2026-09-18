@@ -148,4 +148,32 @@ describe("buildGetChatMessageRequest 3.9.19 wire fields", () => {
     const id = [...iterFields(calls[0]!.value as Uint8Array)].find((f) => f.num === 1 && f.wire === 2)
     expect(new TextDecoder().decode(id!.value as Uint8Array)).toBe("keep")
   })
+
+  it("drops an assistant message left empty after orphan call removal", () => {
+    const msgs: ChatHistoryItem[] = [
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "orphan", name: "bash", arguments: "{}" }],
+      },
+    ]
+    const req = buildGetChatMessageRequest({ ...base, messages: msgs })
+    // only the user prompt survives — no blank assistant shell
+    expect(nestedMessages(req).length).toBe(1)
+  })
+
+  it("keeps thinking-only assistant messages after orphan call removal", () => {
+    const msgs: ChatHistoryItem[] = [
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        content: "",
+        thinking: "still reasoning",
+        tool_calls: [{ id: "orphan", name: "bash", arguments: "{}" }],
+      },
+    ]
+    const req = buildGetChatMessageRequest({ ...base, messages: msgs })
+    expect(nestedMessages(req).length).toBe(2)
+  })
 })

@@ -168,7 +168,7 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
             },
           ],
           async authorize(inputs: Record<string, string> | undefined) {
-            const apiKey = (inputs as Record<string, string> | undefined)?.apiKey
+            const apiKey = inputs?.apiKey
             if (!apiKey) return { type: "failed" }
             // Validate by minting a user_jwt
             try {
@@ -181,7 +181,7 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
         },
       ],
       async loader(getAuth: () => Promise<Auth | undefined>) {
-        const auth = await authForLoader(getAuth as () => Promise<Auth | undefined>)
+        const auth = await authForLoader(getAuth)
         const accessToken = (auth ? await resolveAccessToken(auth) : undefined) ?? sessionAccessToken ?? (process.env.DEVIN_API_KEY ?? process.env.WINDSURF_API_KEY)
         if (accessToken) {
           // Use stale-while-revalidate with deduplication; fresh cache returns immediately

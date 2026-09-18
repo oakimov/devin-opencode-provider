@@ -213,6 +213,40 @@ describe("extractHistory AI SDK v3 tool-call shapes (issue #1)", () => {
     const tool = extractHistory(prompt).find(i => i.role === "tool")
     expect(tool?.content).toBe("user denied")
   })
+
+  it("keeps stray text riding with tool-result parts", () => {
+    const prompt: LanguageModelV3CallOptions["prompt"] = [
+      { role: "user", content: [{ type: "text", text: "go" }] },
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "call_s", toolName: "read", input: {} }] },
+      {
+        role: "tool",
+        content: [
+          { type: "text", text: "side note" },
+          { type: "tool-result", toolCallId: "call_s", toolName: "read", output: { type: "text", value: "kept" } },
+        ],
+      },
+    ]
+    const tools = extractHistory(prompt).filter(i => i.role === "tool")
+    expect(tools.length).toBe(1)
+    expect(String(tools[0]!.content)).toContain("side note")
+    expect(String(tools[0]!.content)).toContain("kept")
+  })
+
+  it("does not unwrap read envelopes for tools merely containing read", () => {
+    const envelope = "<path>/tmp/a.txt</path><type>file</type><content>\n1: hello\n</content>"
+    for (const toolName of ["thread", "todoread", "spreadsheet"]) {
+      const prompt: LanguageModelV3CallOptions["prompt"] = [
+        { role: "user", content: [{ type: "text", text: "go" }] },
+        { role: "assistant", content: [{ type: "tool-call", toolCallId: "call_n", toolName, input: {} }] },
+        {
+          role: "tool",
+          content: [{ type: "tool-result", toolCallId: "call_n", toolName, output: { type: "text", value: envelope } }],
+        },
+      ]
+      const tool = extractHistory(prompt).find(i => i.role === "tool")
+      expect(tool?.content).toBe(envelope)
+    }
+  })
 })
 
 

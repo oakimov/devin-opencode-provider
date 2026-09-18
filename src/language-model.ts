@@ -9,7 +9,7 @@ import { streamChatEvents } from "./protocol/chat.js"
 import { buildLanguageModelV3UsageFromCounters, emptyLanguageModelV3Usage, type DevinUsageCounters } from "./usage.js"
 import { remapDevinEditForApplyPatchCatalog } from "./protocol/apply-patch-bridge.js"
 import { fileArgPhrase, normalizeFileToolArgs } from "./protocol/file-tool-args.js"
-import { extractDevinVariantParameters, resolveDevinWireModelId } from "./models.js"
+import { extractDevinVariantParameters, lookupDevinWireIdAlias, resolveDevinWireModelId } from "./models.js"
 import {
   resolveDevinModelSupportsDocuments,
   resolveDevinModelSupportsImages,
@@ -124,16 +124,27 @@ export function extractHistory(prompt: LanguageModelV3CallOptions["prompt"]): Ch
         ? (c as any[]).filter(p => p && typeof p === "object" && (p as any).type === "tool-result")
         : []
       if (parts.length) {
-        for (const part of parts) {
+        // Hosts only send tool-result parts, but if stray text parts ride along
+        // in the same message, keep them: unpaired text has no tool_call_id and
+        // would be dropped downstream, so fold it into the first item.
+        const stray: string[] = []
+        for (const p of c as any[]) {
+          if (p && typeof p === "object" && (p as any).type === "text" && typeof (p as any).text === "string") {
+            stray.push((p as any).text)
+          }
+        }
+        parts.forEach((part, i) => {
           const toolCallId = typeof part.toolCallId === "string" ? part.toolCallId : raw.toolCallId
           const toolName = typeof part.toolName === "string" ? part.toolName : raw.toolName ?? raw.name
           const result = part.output ?? part.result ?? part.value
+          let content = toolResultToText({ toolName, result: result ?? "" })
+          if (i === 0 && stray.length) content = [...stray, content].filter(Boolean).join("\n")
           out.push({
             role: "tool",
-            content: toolResultToText({ toolName, result: result ?? "" }),
+            content,
             tool_call_id: toolCallId,
           })
-        }
+        })
       } else {
         const result = (raw as any).result ?? (raw as any).output ?? (c !== undefined ? c : raw)
         out.push({
@@ -267,6 +278,13 @@ function toolOutputToString(raw: unknown): string {
   try { return JSON.stringify(raw ?? "") } catch { return String(raw ?? "") }
 }
 
+/** True for the file-read tool only — matched as a whole segment so tools like
+ * `thread`, `todoread`, or `spreadsheet` never get their output unwrapped. */
+function isReadToolName(name: string): boolean {
+  if (name === "read" || name === "opencode-read") return true
+  return /(^|[-_:/])read([-_:/]|$)/i.test(name)
+}
+
 function toolResultToText(m: unknown): string {
   const tr = m as Record<string, unknown>
   const raw = (tr as any).result ?? (tr as any).content ?? tr
@@ -274,7 +292,7 @@ function toolResultToText(m: unknown): string {
   // Unwrap read envelope when this tool result came from `read`.
   // v3 puts toolName on the part; the text may be `{ type: "text", value }`.
   const name = typeof (tr as any).toolName === "string" ? ((tr as any).toolName as string) : typeof (tr as any).name === "string" ? ((tr as any).name as string) : ""
-  if (name === "read" || name === "opencode-read" || name.includes("read")) {
+  if (isReadToolName(name)) {
     return unwrapOpencodeReadOutput(text)
   }
   return text
@@ -375,6 +393,11 @@ export function createDevinLanguageModel(
   }
 }
 
+// Alias-table prime state for doStreamImpl (see below). Module-level so every
+// stream in the process shares it: one cache-file read, then the loader owns
+// refreshes from there.
+let wireAliasPrimed = false
+
 async function doStreamImpl(
   modelId: string,
   options: CreateDevinOptions,
@@ -415,15 +438,27 @@ async function doStreamImpl(
   // Prime the alias table from the model cache so a bare base id resolves to the
   // catalog default wire uid (including opaque PRIVATE_* ids) when the host
   // sends no variant params. Both OpenCode 1.x config and 2.0 inventory already
-  // call modelsToConfig; this covers SDK use before that runs.
-  try {
-    const { readCache } = await import("./models.js")
-    const { modelsToConfig } = await import("./model-config.js")
-    const { opencodeGlobalCacheDir } = await import("./context/paths.js")
-    const _c = await readCache(options.cacheDir ?? opencodeGlobalCacheDir())
-    if (_c?.models.length) modelsToConfig(_c.models)
-  } catch (e) {
-    trace(`devin wire-id alias prime failed: ${(e as Error).message}`)
+  // call modelsToConfig; this covers SDK use before that runs. Prime at most
+  // once, and never clobber a populated table: after a credential switch the
+  // on-disk cache may still hold the previous account, while the loader has
+  // already rebuilt aliases for the new one.
+  if (!wireAliasPrimed) {
+    if (lookupDevinWireIdAlias(modelId, picked) !== undefined || lookupDevinWireIdAlias(modelId, []) !== undefined) {
+      wireAliasPrimed = true
+    } else {
+      try {
+        const { readCache } = await import("./models.js")
+        const { modelsToConfig } = await import("./model-config.js")
+        const { opencodeGlobalCacheDir } = await import("./context/paths.js")
+        const _c = await readCache(options.cacheDir ?? opencodeGlobalCacheDir())
+        if (_c?.models.length) {
+          modelsToConfig(_c.models)
+          wireAliasPrimed = true
+        }
+      } catch (e) {
+        trace(`devin wire-id alias prime failed: ${(e as Error).message}`)
+      }
+    }
   }
   const wireModelId = resolveDevinWireModelId(devinOpts, modelId, picked)
   if (picked || wireModelId !== modelId) {
