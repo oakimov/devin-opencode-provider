@@ -84,5 +84,13 @@ describe("Auth", () => {
       expect(result).toBe(code)
       await fetchPromise
     })
+
+    it("should escape IdP error text in the failure page (reflected XSS)", async () => {
+      server = await createLoopbackServer()
+      const payload = "<script>alert(1)</script>"
+      const body = await fetch(`http://127.0.0.1:${server.port}/callback?error=${encodeURIComponent(payload)}`).then(r => r.text())
+      expect(body).toContain("&lt;script&gt;")
+      expect(body).not.toContain(payload)
+    })
   })
 })

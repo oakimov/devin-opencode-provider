@@ -304,7 +304,10 @@ function slugifyModelLabel(label: string): string {
   return label
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
+    // Two anchored passes instead of /^-+|-+$/ — the alternation backtracks
+    // polynomially on dash-heavy input (codeql js/polynomial-redos).
+    .replace(/^-+/, "")
+    .replace(/-+$/, "")
 }
 
 function titleCaseVariantPhrase(phrase: string): string {
@@ -326,7 +329,11 @@ function parseDisplayVariants(display: string): {
 } {
   let n = safeLabel(display)
   let contextSuffix = ""
-  const oneM = n.match(/\s+1M$/i)
+  // Single \s (not \s+) — the unanchored plus makes every start position scan
+  // to end of string on space-heavy labels (codeql js/polynomial-redos).
+  // Equivalent here: the slice is followed by trim(), which removes any
+  // additional leading whitespace the single-\s match leaves behind.
+  const oneM = n.match(/\s1M$/i)
   if (oneM) {
     contextSuffix = "-1m"
     n = n.slice(0, -oneM[0].length).trim()

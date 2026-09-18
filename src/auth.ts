@@ -223,8 +223,20 @@ type LoopbackServer = {
   waitForCode: (expectedState: string, signal?: AbortSignal) => Promise<string>
 }
 
-export function createLoopbackServer(preferredPort?: number): Promise<LoopbackServer> {
-  return new Promise((resolve, reject) => {
+/** Escape user-controlled text for the loopback consent/error pages (reflected XSS). */
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (ch) => {
+    switch (ch) {
+      case "&": return "&amp;"
+      case "<": return "&lt;"
+      case ">": return "&gt;"
+      case '"': return "&quot;"
+      default: return "&#39;"
+    }
+  })
+}
+
+export function createLoopbackServer(preferredPort?: number): Promise<LoopbackServer> {  return new Promise((resolve, reject) => {
     let capturedToken: { token: string; state: string } | null = null
     let capturedCode: { code: string; state: string } | null = null
     let pendingError: string | null = null
@@ -247,7 +259,7 @@ export function createLoopbackServer(preferredPort?: number): Promise<LoopbackSe
 
       if (error) {
         res.writeHead(400, { "Content-Type": "text/html" })
-        res.end(`<html><body><h1>Sign-in failed</h1><p>${error}</p></body></html>`)
+        res.end(`<html><body><h1>Sign-in failed</h1><p>${escapeHtml(error)}</p></body></html>`)
         pendingError = error
         for (const w of [...tokenWaiters, ...codeWaiters].splice(0)) w.reject(new AuthPollError(error))
         tokenWaiters.length = 0; codeWaiters.length = 0
