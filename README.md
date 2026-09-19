@@ -20,6 +20,7 @@ OpenCode driving a Devin-routed model through this provider:
 - **Image input** — advertises vision only for supported models and forwards OpenCode image attachments to Devin
 - **Streaming** — bidirectional Connect-RPC chat with token usage tracking
 - **Tool calls** — maps Devin tool messages to AI SDK / OpenCode tool-call parts
+- **Safe file reads** — strips OpenCode 1.x/2.0 read wrappers, preserves truncation meaning, and refuses whole-file writes copied from partial reads
 - **Thinking / reasoning** — surfaces extended-thinking deltas where the model supports it
 
 ## Requirements

@@ -16,7 +16,8 @@ describe("read unwrap contract (via guidance)", () => {
 
   it("guidance warns about capped reads", () => {
     const g = buildDevinOpenCodeGuidance([{ name: "read", description: "", parameters: {} }], "/tmp")!
-    expect(g).toContain("Output capped at 50 KB")
+    expect(g).toContain("[Partial read: ...]")
+    expect(g).toContain("50 KB")
     expect(g).toContain("re-`read`")
   })
 })

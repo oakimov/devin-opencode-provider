@@ -10,6 +10,9 @@ import { streamChatEvents } from "./protocol/chat.js"
 import { buildLanguageModelV3UsageFromCounters, emptyLanguageModelV3Usage, type DevinUsageCounters } from "./usage.js"
 import { remapDevinEditForApplyPatchCatalog } from "./protocol/apply-patch-bridge.js"
 import { fileArgPhrase, normalizeFileToolArgs } from "./protocol/file-tool-args.js"
+import { normalizeOpenCodeReadOutput } from "./protocol/read-output.js"
+import { groundToolResultText, isReadToolName } from "./protocol/tool-paths.js"
+import { mutationArgsWithoutContent, partialReadMutationRefusal } from "./protocol/partial-read-guard.js"
 import {
   advertisedToolNames,
   hostShellTool,
@@ -55,8 +58,12 @@ function extractSystemPrompt(prompt: LanguageModelV3CallOptions["prompt"]): stri
 }
 
 /** Exported for issue #1 round-trip tests (AI SDK v3 tool-call shapes). */
-export function extractHistory(prompt: LanguageModelV3CallOptions["prompt"]): ChatHistoryItem[] {
+export function extractHistory(
+  prompt: LanguageModelV3CallOptions["prompt"],
+  workspaceRoot?: string,
+): ChatHistoryItem[] {
   const out: ChatHistoryItem[] = []
+  const toolCallsById = new Map<string, { toolName: string; input: unknown }>()
   for (const m of prompt) {
     if (m.role === "system") continue
     if (m.role === "user") {
@@ -128,6 +135,7 @@ export function extractHistory(prompt: LanguageModelV3CallOptions["prompt"]): Ch
         if (!tc.toolCallId || seenCallIds.has(tc.toolCallId)) continue
         seenCallIds.add(tc.toolCallId)
         merged.push(tc)
+        toolCallsById.set(tc.toolCallId, { toolName: tc.toolName, input: tc.input })
       }
       const item: ChatHistoryItem = {
         role: "assistant",
@@ -158,9 +166,10 @@ export function extractHistory(prompt: LanguageModelV3CallOptions["prompt"]): Ch
         }
         parts.forEach((part, i) => {
           const toolCallId = typeof part.toolCallId === "string" ? part.toolCallId : raw.toolCallId
-          const toolName = typeof part.toolName === "string" ? part.toolName : raw.toolName ?? raw.name
+          const correlated = typeof toolCallId === "string" ? toolCallsById.get(toolCallId) : undefined
+          const toolName = typeof part.toolName === "string" ? part.toolName : raw.toolName ?? raw.name ?? correlated?.toolName
           const result = part.output ?? part.result ?? part.value
-          let content = toolResultToText({ toolName, result: result ?? "" })
+          let content = toolResultToText({ toolName, result: result ?? "", toolInput: correlated?.input }, workspaceRoot)
           if (i === 0 && stray.length) content = [...stray, content].filter(Boolean).join("\n")
           out.push({
             role: "tool",
@@ -170,9 +179,10 @@ export function extractHistory(prompt: LanguageModelV3CallOptions["prompt"]): Ch
         })
       } else {
         const result = (raw as any).result ?? (raw as any).output ?? (c !== undefined ? c : raw)
+        const correlated = typeof raw.toolCallId === "string" ? toolCallsById.get(raw.toolCallId) : undefined
         out.push({
           role: "tool",
-          content: toolResultToText({ toolName: raw.toolName ?? raw.name, result }),
+          content: toolResultToText({ toolName: raw.toolName ?? raw.name ?? correlated?.toolName, result, toolInput: correlated?.input }, workspaceRoot),
           tool_call_id: raw.toolCallId,
         })
       }
@@ -213,7 +223,7 @@ function extractTools(callOptions: LanguageModelV3CallOptions): ToolDef[] {
     const pathArg = fileArgPhrase(schema)
     if (t.name === "read") {
       description =
-        `Read a text file, image, or directory. Args: ${pathArg} — absolute or relative to workspace root, optional \`offset\` (1-based line/entry) and \`limit\`. Returns raw file text (no \`1: \` line-number prefixes, no XML wrapper — those are stripped before you see it). If result ends with \`(Output capped at 50 KB\` or \`Use offset=\` the file was truncated: you MUST re-read remaining ranges with \`offset\`/\`limit\` before editing or rewriting. Always \`read\` a file before \`edit\`.`
+        `Read a text file, image, or directory. Args: ${pathArg} — absolute or relative to workspace root, optional \`offset\` (1-based line/entry) and \`limit\`. Returns raw file text (OpenCode\'s wrappers and \`1: \` line-number prefixes are stripped before you see it). A \`[Partial read: ...]\` notice means the host hit its 50 KB, 2,000-line, or 2,000-character-per-line limit: you MUST read the missing content before editing or rewriting the whole file. Always \`read\` a file before \`edit\`.`
     } else if (t.name === "edit") {
       description =
         `Surgically replace exact text in an EXISTING file. Args: ${pathArg}, \`oldString\` (exact byte-for-byte match including whitespace/indentation/line breaks, must be unique in file), \`newString\` (must differ from oldString), optional \`replaceAll\` (boolean, default false). Include 2–3 lines of exact surrounding context in \`oldString\` so the match is unambiguous. If tool returns \`oldString not found\` or \`multiple matches\`, re-\`read\` the file and copy a larger exact surrounding block verbatim. Never include line-number prefixes like \`1: \` — they are not in the file. Never use \`edit\` to create a new file; use \`write\`. Always \`read\` first.`
@@ -227,62 +237,6 @@ function extractTools(callOptions: LanguageModelV3CallOptions): ToolDef[] {
       parameters: schema,
     }
   })
-}
-
-// Opencode's `read` tool wraps file content in XML and caps at 50 KB.
-// It emits numbered lines inside <content>:
-//   <path>/foo</path><type>file</type><content>\n1: line1\n2: line2\n\n(Output capped at 50 KB...)\n</content>
-// Strip the envelope and the "N: " prefixes so Devin sees raw file content,
-// but preserve the truncation footer so the guidance warning remains visible.
-// Mirrors cursor's unwrapReadOutput (src/protocol/tools.ts:1641) — critical for
-// not teaching Devin that a capped read is the complete file (cursor bug at 1824).
-function unwrapOpencodeReadOutput(text: string): string {
-  if (typeof text !== "string" || text.length === 0) return text
-  const contentHeaderIdx = text.indexOf("<content>")
-  if (contentHeaderIdx === -1) return text
-  const header = text.slice(0, contentHeaderIdx)
-  const hasSkeleton = header.includes("<path>") && header.includes("<type>file</type>")
-  if (!hasSkeleton) {
-    trace("unwrapReadOutput: <content> present without <path>/<type>file> skeleton — leaving unchanged (possible format drift)")
-    return text
-  }
-  let rest = text.slice(contentHeaderIdx + "<content>".length)
-  if (rest.startsWith("\n")) rest = rest.slice(1)
-  const raw: string[] = []
-  for (const line of rest.split("\n")) {
-    const m = /^(\d+):[ \t]?(.*)$/.exec(line)
-    if (!m) break // blank / "(Output capped..." / "</content>" → end of body run
-    raw.push(m[2])
-  }
-  // Envelope confirmed but no numbered body → empty file
-  if (raw.length === 0 && rest.startsWith("</content>")) return ""
-  // If we didn't consume any numbered lines, fall back to simple extraction (handles
-  // future opencode format without line numbers) but strip wrapper tags.
-  if (raw.length === 0) {
-    const mm = text.match(/<content>([\s\S]*?)<\/content>/)
-    if (mm) {
-      const inner = mm[1].trim()
-      const after = text.slice(text.indexOf("</content>") + "</content>".length).trim()
-      // Only preserve genuine truncation footer, not stray XML like </read>
-      if (after && after.includes("Output capped")) return inner + "\n\n" + after.replace(/<\/read>.*$/s, "").trim()
-      return inner
-    }
-    return text
-  }
-  // Check for truncation footer after the numbered block — it appears as a blank line + "(Output capped..."
-  // Our loop stopped at the blank line; look ahead for footer text.
-  const lines = rest.split("\n")
-  let footer = ""
-  for (let i = raw.length + 1; i < lines.length; i++) {
-    const l = lines[i].trim()
-    if (l.startsWith("(Output capped") || l.startsWith("Use offset=")) {
-      footer = lines.slice(i).join("\n").replace(/<\/content>.*$/s, "").replace(/<\/read>.*$/s, "").trim()
-      break
-    }
-    if (l.startsWith("</content")) break
-  }
-  const content = raw.join("\n")
-  return footer ? `${content}\n\n${footer}` : content
 }
 
 function toolOutputToString(raw: unknown): string {
@@ -301,24 +255,16 @@ function toolOutputToString(raw: unknown): string {
   try { return JSON.stringify(raw ?? "") } catch { return String(raw ?? "") }
 }
 
-/** True for the file-read tool only — matched as a whole segment so tools like
- * `thread`, `todoread`, or `spreadsheet` never get their output unwrapped. */
-function isReadToolName(name: string): boolean {
-  if (name === "read" || name === "opencode-read") return true
-  return /(^|[-_:/])read([-_:/]|$)/i.test(name)
-}
-
-function toolResultToText(m: unknown): string {
+function toolResultToText(m: unknown, workspaceRoot?: string): string {
   const tr = m as Record<string, unknown>
   const raw = (tr as any).result ?? (tr as any).content ?? tr
   const text = toolOutputToString(raw)
   // Unwrap read envelope when this tool result came from `read`.
   // v3 puts toolName on the part; the text may be `{ type: "text", value }`.
   const name = typeof (tr as any).toolName === "string" ? ((tr as any).toolName as string) : typeof (tr as any).name === "string" ? ((tr as any).name as string) : ""
-  if (isReadToolName(name)) {
-    return unwrapOpencodeReadOutput(text)
-  }
-  return text
+  const input = (tr as any).toolInput
+  const unwrapped = isReadToolName(name) ? normalizeOpenCodeReadOutput(text, input) : text
+  return groundToolResultText(name, unwrapped, workspaceRoot, input)
 }
 
 export function buildDevinOpenCodeGuidance(tools: ToolDef[], workspaceRoot: string): string | undefined {
@@ -336,7 +282,7 @@ export function buildDevinOpenCodeGuidance(tools: ToolDef[], workspaceRoot: stri
   if (names.has("read")) {
     const pathArg = fileArgPhrase(schemaOf("read"))
     instructions.push(
-      `- \`read\` — Takes ${pathArg} (absolute or relative to workspace root) and optional \`offset\`/\`limit\`. Returns raw file text (line-number prefixes and \`<path>/<content>\` wrapper are already stripped — do not copy \`1: \` prefixes into edits). If the result ends with \`(Output capped at 50 KB\` or \`Use offset=\` / \`requires another offset\`, the file was truncated: you MUST re-\`read\` the remaining ranges with \`offset\` before using the content. Never pass a capped/partial read as whole-file content to \`write\`. Always \`read\` a file before \`edit\`.`,
+      `- \`read\` — Takes ${pathArg} (absolute or relative to workspace root) and optional \`offset\`/\`limit\`. Returns raw file text (OpenCode 1.x/2.0 wrappers and line-number prefixes are already stripped — do not copy \`1: \` prefixes into edits). A \`[Partial read: ...]\` notice means the host hit its 50 KB, 2,000-line, or 2,000-character-per-line limit: follow its instruction and re-\`read\` the missing content with the requested offset or a byte-preserving method before acting on the whole file. Never pass a partial read as whole-file content to \`write\`; the provider refuses that mutation. Always \`read\` a file before \`edit\`.`,
     )
   }
   if (names.has("edit")) {
@@ -541,7 +487,7 @@ async function doStreamImpl(
   const workspaceRoot = path.resolve(
     getSessionDirectory(sessionKey) ?? options.workspaceRoot ?? (callOptions as any).workspaceRoot ?? process.cwd(),
   )
-  let messages = extractHistory(callOptions.prompt)
+  let messages = extractHistory(callOptions.prompt, workspaceRoot)
   if (attachmentExtraction?.attachments.length) {
     messages = injectAttachmentsOntoLastUser(
       messages,
@@ -724,6 +670,24 @@ async function doStreamImpl(
         let refused: { reason: string; originalTool: string } | null = null
         let parsed: unknown
         try { parsed = JSON.parse(tc.args) } catch { parsed = tc.args }
+        const partialReadRefusal = partialReadMutationRefusal(toolName, parsed)
+        if (partialReadRefusal) {
+          const target = partialReadRefusal.filePath ? JSON.stringify(partialReadRefusal.filePath) : "the target file"
+          const errMsg = `NO FILE CHANGE WAS MADE. Refusing a whole-file mutation of ${target} because it contains the provider's partial-read notice. Do not retry the same mutation. ${partialReadRefusal.reason}`
+          trace(`devin partial-read mutation refused ${toolName}: ${errMsg}`)
+          if (advertisedNames.has("apply_patch") && !advertisedNames.has("write")) {
+            emitToolCall(tc.id, "apply_patch", JSON.stringify({ patchText: `*** Begin Patch\n*** Update File: ${errMsg}\n*** End Patch` }))
+          } else {
+            const emitted = remapEmittedToolCall(toolName, mutationArgsWithoutContent(parsed), advertisedNames)
+            const normalized = normalizeFileToolArgs(emitted.toolName, emitted.args, schemaOf(emitted.toolName))
+            emitToolCall(tc.id, emitted.toolName, JSON.stringify(normalized))
+          }
+          const warnId = crypto.randomUUID()
+          controller.enqueue({ type: "text-start", id: warnId } as LanguageModelV3StreamPart)
+          controller.enqueue({ type: "text-delta", id: warnId, delta: `\n\n⚠️ ${errMsg}\n` } as LanguageModelV3StreamPart)
+          controller.enqueue({ type: "text-end", id: warnId } as LanguageModelV3StreamPart)
+          continue
+        }
         if (needsPatch && (toolName === "write" || toolName === "edit")) {
           const remapped = remapDevinEditForApplyPatchCatalog({
             toolName,
