@@ -31,6 +31,15 @@ function toolPathSeparator(filePath: string): string {
  * roots intact, including `..`, and still use `path.resolve` for host paths.
  */
 function joinToolPath(root: string, relative: string): string {
+  // `path.resolve` drops a trailing separator. Glob and find use that separator
+  // to tell a directory from a file; putting it back keeps the marker.
+  const directory = relative.endsWith("/") || relative.endsWith("\\")
+  const joined = joinResolvedToolPath(root, relative)
+  if (!directory || joined.endsWith("/") || joined.endsWith("\\")) return joined
+  return `${joined}${toolPathSeparator(joined)}`
+}
+
+function joinResolvedToolPath(root: string, relative: string): string {
   if (!isForeignAbsoluteToolPath(root)) return path.resolve(root, relative)
   const sep = toolPathSeparator(root)
   const base = splitForeignAbsolute(root, sep)
@@ -184,19 +193,170 @@ function groundDirectoryOutput(output: string, workspaceRoot: string | undefined
 }
 
 /**
+ * Longer phrases first. "No files found" is a prefix of the pattern sentence,
+ * and a suffix check must not stop on the shorter one.
+ */
+const SEARCH_STATUS_MESSAGES = [
+  "No files found matching pattern",
+  "No matches before timeout (scan incomplete)",
+  "No files found",
+  "No matches found",
+]
+
+/**
+ * A glob/find miss is prose, not a path. Hosts sometimes still carry it as a
+ * path segment (`../../workspace/No files found matching pattern`) or fold that
+ * segment into a `# dir/` header plus a bare sentence. Either shape must stay
+ * the sentence: joining it onto the workspace is what lists a fake file.
+ */
+function searchStatusMessage(line: string): string | undefined {
+  const trimmed = line.trim().replace(/^#+\s+/, "")
+  for (const message of SEARCH_STATUS_MESSAGES) {
+    if (trimmed === message || trimmed.endsWith(`/${message}`) || trimmed.endsWith(`\\${message}`)) {
+      return message
+    }
+  }
+  return undefined
+}
+
+function collapseSearchStatus(output: string): string {
+  return output.split("\n").map((line) => searchStatusMessage(line) ?? line).join("\n")
+}
+
+function isSearchStatusReport(output: string): boolean {
+  const lines = output.split("\n").map((line) => line.trim()).filter(Boolean)
+  return lines.length > 0 && lines.every((line) => searchStatusMessage(line) !== undefined)
+}
+
+/**
+ * File find/glob results are one path per line. Some hosts instead print a
+ * folded tree:
+ *
+ *   # src/
+ *   a.ts
+ *   ## components/
+ *   button.tsx
+ *   # tests/
+ *
+ * A `# dir/` line is a grouping header, not another match. Emitting it lists
+ * the directory beside its own children (and the shared search prefix shows up
+ * as a blank entry once that prefix is the directory being searched). Expand
+ * the tree to the files underneath only. A header with no child is still just
+ * an empty directory in the walk — leave it out (same as targeting that empty
+ * directory and getting a miss).
+ */
+function parseGroupedPathListing(output: string): { paths: string[]; notes: string[] } | undefined {
+  const lines = output.replace(/\n+$/, "").split("\n")
+  type Event =
+    | { kind: "dir"; depth: number; path: string }
+    | { kind: "file"; path: string }
+    | { kind: "note"; text: string }
+  const events: Event[] = []
+  const stack: string[] = []
+  let sawHeader = false
+  let inNotes = false
+
+  for (const line of lines) {
+    if (!line.trim()) {
+      if (sawHeader) inNotes = true
+      continue
+    }
+    if (inNotes) {
+      events.push({ kind: "note", text: line })
+      continue
+    }
+    const status = searchStatusMessage(line)
+    if (status) {
+      events.push({ kind: "note", text: status })
+      continue
+    }
+    const header = /^(#+)\s+(\S.*?)\s*$/.exec(line)
+    if (header) {
+      const rawName = header[2] ?? ""
+      if (!rawName.endsWith("/") && !rawName.endsWith("\\")) return undefined
+      const depth = header[1]!.length - 1
+      if (depth > stack.length) return undefined
+      const name = rawName.slice(0, -1)
+      if (!name || name === "." || name === "..") return undefined
+      stack.length = depth
+      const parent = depth === 0 ? "" : (stack[depth - 1] ?? "")
+      if (depth > 0 && !parent) return undefined
+      const full = parent ? joinDisplayPath(parent, name) : name
+      stack.push(full)
+      events.push({ kind: "dir", depth, path: full })
+      sawHeader = true
+      continue
+    }
+    if (line.startsWith(" ") || line.startsWith("\t") || /\s/.test(line) || line.includes("://")) {
+      return undefined
+    }
+    if (line.includes("/") || line.includes("\\")) return undefined
+    if (!sawHeader) {
+      events.push({ kind: "file", path: line })
+      continue
+    }
+    const parent = stack[stack.length - 1]
+    if (!parent) return undefined
+    events.push({ kind: "file", path: joinDisplayPath(parent, line) })
+  }
+  if (!sawHeader) return undefined
+
+  const paths: string[] = []
+  const notes: string[] = []
+  let sawFile = false
+  for (const event of events) {
+    if (event.kind === "note") notes.push(event.text)
+    else if (event.kind === "file") {
+      sawFile = true
+      paths.push(event.path)
+    }
+    // Directory headers are structure only — never emit them as matches.
+  }
+  // The header existed only to hold the miss sentence. Emitting it lists a
+  // directory that was never a match, usually the walk back to the workspace.
+  if (!sawFile && notes.some((note) => searchStatusMessage(note))) return { paths: [], notes }
+  return { paths, notes }
+}
+
+function joinDisplayPath(parent: string, child: string): string {
+  if (!parent || parent === ".") return child
+  if (parent === "/") return `/${child}`
+  const sep = parent.includes("\\") && !parent.includes("/") ? "\\" : "/"
+  if (parent.endsWith("/") || parent.endsWith("\\")) return `${parent}${child}`
+  return `${parent}${sep}${child}`
+}
+
+function renderGroupedPathListing(
+  listing: { paths: string[]; notes: string[] },
+  workspaceRoot: string | undefined,
+): string {
+  const paths = listing.paths.map((entry) => resolveToolPath(entry, workspaceRoot))
+  if (paths.length === 0) {
+    // Grouped output that only had directory headers (empty dirs) is a miss,
+    // same as targeting that empty directory directly.
+    if (listing.notes.length === 0) return "No files found"
+    return listing.notes.join("\n")
+  }
+  if (listing.notes.length === 0) return paths.join("\n")
+  return [...paths, "", ...listing.notes].join("\n")
+}
+
+/**
  * Rewrite OpenCode grep/glob lines that are still project-relative. Absolute
  * paths, indented match previews, and prose stay untouched. Line previews are
  * never dropped: Devin forwards the text, it does not re-encode a files-only list.
  */
 function groundSearchOutput(output: string, workspaceRoot: string | undefined): string {
-  if (!workspaceRoot) return output
   const normalized = normalizeToolText(output)
-  const first = normalized.split("\n", 1)[0] ?? ""
-  const searchShaped = /^Found \d+ matches/.test(first)
-    || first === "No matches found"
-    || first === "No files found"
-  if (!searchShaped && !isBarePathList(normalized)) return output
-  return normalized.split("\n").map((line) => rewriteSearchPathLine(line, workspaceRoot)).join("\n")
+  const grouped = parseGroupedPathListing(normalized)
+  if (grouped) return renderGroupedPathListing(grouped, workspaceRoot)
+  const collapsed = collapseSearchStatus(normalized)
+  if (isSearchStatusReport(collapsed)) return collapsed
+  if (!workspaceRoot) return collapsed
+  const first = collapsed.split("\n", 1)[0] ?? ""
+  const searchShaped = /^Found \d+ matches/.test(first) || searchStatusMessage(first) !== undefined
+  if (!searchShaped && !isBarePathList(collapsed)) return collapsed
+  return collapsed.split("\n").map((line) => rewriteSearchPathLine(line, workspaceRoot)).join("\n")
 }
 
 function isBarePathList(output: string): boolean {
@@ -211,7 +371,8 @@ function isBarePathList(output: string): boolean {
 
 function rewriteSearchPathLine(line: string, workspaceRoot: string): string {
   if (!line || line.startsWith(" ") || line.startsWith("\t") || line.startsWith("(")) return line
-  if (line.startsWith("Found ") || line === "No matches found" || line === "No files found") return line
+  const status = searchStatusMessage(line)
+  if (status || line.startsWith("Found ")) return status ?? line
   const header = /^(.*):$/.exec(line)
   if (header && !header[1]?.includes("://")) {
     return `${resolveToolPath(header[1] ?? "", workspaceRoot)}:`

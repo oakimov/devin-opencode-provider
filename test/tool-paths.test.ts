@@ -48,6 +48,88 @@ describe("groundToolResultText", () => {
     )
   })
 
+  it("flattens grouped glob listings to files only", () => {
+    const output = [
+      "README.md",
+      "# src/",
+      "a.ts",
+      "## components/",
+      "button.tsx",
+      "# src/protocol/",
+      "tools.ts",
+      "# tests/",
+      "",
+      "Skipped missing paths: gone",
+    ].join("\n")
+    expect(groundToolResultText("glob", output, root)).toBe(
+      [
+        `${root}/README.md`,
+        `${root}/src/a.ts`,
+        `${root}/src/components/button.tsx`,
+        `${root}/src/protocol/tools.ts`,
+        "",
+        "Skipped missing paths: gone",
+      ].join("\n"),
+    )
+    expect(groundToolResultText("glob", "src/\nsrc/a.ts", root)).toBe(
+      [`${root}/src/`, `${root}/src/a.ts`].join("\n"),
+    )
+  })
+
+  it("drops grouping headers that would list directories beside their files", () => {
+    const repro = [
+      "# /tmp/glob-repro/",
+      "afile.txt",
+      "## empty/",
+      "## onlydir/nested/",
+      "main.log",
+      "## dir-only-log/oh-my-pi/",
+      "main.log",
+    ].join("\n")
+    expect(groundToolResultText("glob", repro, root)).toBe(
+      [
+        "/tmp/glob-repro/afile.txt",
+        "/tmp/glob-repro/onlydir/nested/main.log",
+        "/tmp/glob-repro/dir-only-log/oh-my-pi/main.log",
+      ].join("\n"),
+    )
+    expect(groundToolResultText("glob", ["# /tmp/glob-repro/onlydir/nested/", "main.log"].join("\n"), root)).toBe(
+      "/tmp/glob-repro/onlydir/nested/main.log",
+    )
+    expect(
+      groundToolResultText(
+        "glob",
+        ["# /opt/local/var/macports/logs/", "## foo/", "main.log", "## bar/", "main.log"].join("\n"),
+        root,
+      ),
+    ).toBe(
+      ["/opt/local/var/macports/logs/foo/main.log", "/opt/local/var/macports/logs/bar/main.log"].join("\n"),
+    )
+    expect(groundToolResultText("glob", ["# /tmp/glob-repro/", "## empty/", "## also/"].join("\n"), root)).toBe(
+      "No files found",
+    )
+  })
+
+  it("does not turn a glob miss into a path back to the workspace", () => {
+    const miss = "No files found matching pattern"
+    const samples = [
+      miss,
+      ["# ../../../Users/mitra/Projects/macports-ports/", miss].join("\n"),
+      `../../../Users/mitra/Projects/macports-ports/${miss}`,
+      `# ../../../Users/mitra/Projects/macports-ports/${miss}`,
+    ]
+    for (const output of samples) {
+      expect(groundToolResultText("glob", output, root)).toBe(miss)
+    }
+    expect(
+      groundToolResultText(
+        "glob",
+        ["# /tmp/glob-repro/", "## empty/", "## full/", "a.txt", "## also/"].join("\n"),
+        root,
+      ),
+    ).toBe("/tmp/glob-repro/full/a.txt")
+  })
+
   it("joins OpenCode 2 directory names onto the directory, including Windows and UNC", () => {
     expect(groundToolResultText("read", ["Read directory src, entries 1-4", "./a.ts", "../b.ts", "nested/", "~/keep.ts"].join("\n"), root)).toBe(
       [
