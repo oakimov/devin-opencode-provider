@@ -4,7 +4,7 @@ import path from "node:path"
 import * as zlib from "node:zlib"
 import { MODEL_CACHE_FILE, MODEL_CACHE_SCHEMA_VERSION, MODEL_CACHE_TTL_MS } from "./shared.js"
 import { buildMetadata } from "./protocol/metadata.js"
-import { concat, encodeMessage, iterFields } from "./protocol/wire.js"
+import { encodeMessage, iterFields } from "./protocol/wire.js"
 import { getCachedUserJwt } from "./auth.js"
 import { trace } from "./debug.js"
 
@@ -254,7 +254,7 @@ function appendWireSegments(baseId: string, segments: string[]): string {
  * Reconstruct Devin's flat `model_uid` from an OpenCode base id + variant
  * parameters. Devin has no parameter marketplace — each effort/speed/thinking
  * combo is a distinct uid (`claude-opus-5-medium`, `MODEL_…_THINKING`, …).
- * OpenCode only sees the base id with parameter-only variants (Cursor shape).
+ * OpenCode only sees the base id with parameter-only variants.
  *
  * Inverse of `variantNameToParams` in `model-config.ts`.
  * `thinking=false` → bare base (paired non-thinking models have no suffix).
@@ -429,7 +429,7 @@ export function isCacheFreshWithTtl(cache: ModelCache, ttlMs = MODEL_CACHE_TTL_M
   return isCacheFresh(cache, ttlMs)
 }
 
-// ── Fetch + cache orchestration (mirrors cursor provider) ──
+// ── Fetch + cache orchestration ──
 
 async function fetchDevinModels(accessToken: string, opts: { baseURL?: string; signal?: AbortSignal } = {}): Promise<ModelInfo[]> {
   const base = (opts.baseURL ?? process.env.DEVIN_API_BASE_URL ?? process.env.WINDSURF_API_BASE_URL ?? "https://server.codeium.com").replace(/\/$/, "")
@@ -534,8 +534,8 @@ export async function fetchModels(
 
 /**
  * Fetch live model list with stale-while-revalidate and deduplication.
- * Mirrors cursor provider: fresh cache → serve immediately + background refresh;
- * stale cache → try refresh, serve stale on failure; no cache → must fetch.
+ * Fresh cache → serve immediately + background refresh; stale cache → try
+ * refresh and serve stale on failure; no cache → must fetch.
  */
 export async function discoverModels(
   accessToken: string,

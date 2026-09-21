@@ -83,14 +83,14 @@ describe("groundToolResultText", () => {
       "## empty/",
       "## onlydir/nested/",
       "main.log",
-      "## dir-only-log/oh-my-pi/",
+      "## dir-only-log/nested-tool/",
       "main.log",
     ].join("\n")
     expect(groundToolResultText("glob", repro, root)).toBe(
       [
         "/tmp/glob-repro/afile.txt",
         "/tmp/glob-repro/onlydir/nested/main.log",
-        "/tmp/glob-repro/dir-only-log/oh-my-pi/main.log",
+        "/tmp/glob-repro/dir-only-log/nested-tool/main.log",
       ].join("\n"),
     )
     expect(groundToolResultText("glob", ["# /tmp/glob-repro/onlydir/nested/", "main.log"].join("\n"), root)).toBe(
@@ -114,9 +114,9 @@ describe("groundToolResultText", () => {
     const miss = "No files found matching pattern"
     const samples = [
       miss,
-      ["# ../../../Users/mitra/Projects/macports-ports/", miss].join("\n"),
-      `../../../Users/mitra/Projects/macports-ports/${miss}`,
-      `# ../../../Users/mitra/Projects/macports-ports/${miss}`,
+      ["# ../../../workspace/example-project/", miss].join("\n"),
+      `../../../workspace/example-project/${miss}`,
+      `# ../../../workspace/example-project/${miss}`,
     ]
     for (const output of samples) {
       expect(groundToolResultText("glob", output, root)).toBe(miss)

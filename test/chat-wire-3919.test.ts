@@ -46,6 +46,80 @@ describe("buildGetChatMessageRequest 3.9.19 wire fields", () => {
     expect(top.get(27)?.[0]).toBe("cache-key-1")
   })
 
+  it("canonicalizes JSON-schema key order without re-sorting tools", () => {
+    const msgs: ChatHistoryItem[] = [{ role: "user", content: "hi" }]
+    const first = buildGetChatMessageRequest({
+      ...base,
+      messages: msgs,
+      tools: [
+        {
+          name: "zeta",
+          description: "Zeta tool",
+          parameters: {
+            type: "object",
+            properties: {
+              second: { description: "second", type: "string" },
+              first: { type: "number", description: "first" },
+            },
+          },
+        },
+        {
+          name: "alpha",
+          description: "Alpha tool",
+          parameters: { required: ["value"], properties: { value: { type: "string" } }, type: "object" },
+        },
+      ],
+    })
+    const second = buildGetChatMessageRequest({
+      ...base,
+      messages: msgs,
+      tools: [
+        {
+          name: "zeta",
+          description: "Zeta tool",
+          parameters: {
+            properties: {
+              first: { description: "first", type: "number" },
+              second: { type: "string", description: "second" },
+            },
+            type: "object",
+          },
+        },
+        {
+          name: "alpha",
+          description: "Alpha tool",
+          parameters: { type: "object", properties: { value: { type: "string" } }, required: ["value"] },
+        },
+      ],
+    })
+
+    const toolBytes = (request: Uint8Array) => [...iterFields(request)]
+      .filter((field) => field.num === 10 && field.wire === 2 && field.value instanceof Uint8Array)
+      .map((field) => Buffer.from(field.value as Uint8Array).toString("hex"))
+    // Metadata intentionally includes a current timestamp, so compare the
+    // cache-relevant tool definitions rather than the entire request envelope.
+    expect(toolBytes(first)).toEqual(toolBytes(second))
+  })
+
+  it("emits advertised tool order instead of re-sorting by name", () => {
+    const req = buildGetChatMessageRequest({
+      ...base,
+      messages: [{ role: "user", content: "hi" }],
+      tools: [
+        { name: "zeta", description: "Z", parameters: { type: "object" } },
+        { name: "alpha", description: "A", parameters: { type: "object" } },
+      ],
+    })
+    const names = [...iterFields(req)]
+      .filter((field) => field.num === 10 && field.wire === 2 && field.value instanceof Uint8Array)
+      .map((field) => {
+        const name = [...iterFields(field.value as Uint8Array)]
+          .find((inner) => inner.num === 1 && inner.wire === 2 && inner.value instanceof Uint8Array)
+        return name ? new TextDecoder().decode(name.value as Uint8Array) : ""
+      })
+    expect(names).toEqual(["zeta", "alpha"])
+  })
+
   it("encodes VideoData #20 and DocumentData #21 on user prompts", () => {
     const msgs: ChatHistoryItem[] = [{
       role: "user",

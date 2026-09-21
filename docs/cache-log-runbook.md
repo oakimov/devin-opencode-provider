@@ -26,6 +26,37 @@ export DEVIN_PROVIDER_DEBUG=1
 export DEVIN_PROVIDER_DEBUG_FILE=/path/to/debug.log
 ```
 
+The provider announces `[devin-provider] DEVIN_PROVIDER_DEBUG logging to …`.
+A fresh empty file gets a process header on first init. Re-init in the same
+override path (module reload, second isolate) **appends** another header
+(`reinit=append`) instead of wiping earlier lines. Independently, once the
+file reaches 10 MiB the next `trace` call truncates it and writes
+`debug: size-cap truncate` so growth stays bounded. Truncate the override
+path yourself before a clean run.
+
+### Self-verify markers
+
+With debug enabled, each real turn should emit:
+
+| Prefix | Meaning |
+|--------|---------|
+| `extractTools:` | Incoming → advertised tool catalog |
+| `outbound Run:` | Turn start (model, cascade, tools, message sizes) |
+| `hash systemPrompt` / `hash prefix` | Continuity fingerprints of prompt + tools |
+| `GetChatMessage protoBytes=` | Actual GetChatMessage protobuf size |
+| `host tool dialect:` | `filePathKey` + shell tool + catalog |
+| `exec: EMITTED tool-call` | Each tool call sent to the host |
+| `finish: reason=` | Turn end + usage totals |
+| `turn usage validation:` | `status=ok` / `mismatch` |
+| `cache diagnosis:` | `continuity=warm\|cold`, `prefixHash`, `perModelCallCache=unavailable` |
+
+`outbound Run:` does not invent RequestContext, skills, checkpoints, or
+`runRequestBytes`. Compare cache with `rawReadVsPriorContext` or, when
+`cacheRead > input`, `reconstructedHit`.
+
+Live paste-ready prompt:
+`opencode-plugin-compat/docs/guides/devin-ocp-self-verify.md`.
+
 ## Cache troubleshooting
 
 ### Empty model list

@@ -77,8 +77,7 @@ export function modelConfigEntryToInfo(
 ): CatalogModelInfo {
   const options = entry.options as Record<string, unknown> | undefined
   // OpenCode id === catalog id. Devin wire uids (`…-medium`, `…-low-fast`) are
-  // reconstructed in the language model from variant parameters — same shape as
-  // Cursor (one model id, parameter-only variants).
+  // reconstructed in the language model from parameter-only variants.
   const variants: ModelVariantInfo[] = Object.entries(
     (entry.variants ?? {}) as Record<string, Record<string, unknown>>,
   ).map(([variantId, settings]) => ({ id: variantId, settings: { ...settings } }))

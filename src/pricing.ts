@@ -1,6 +1,6 @@
 /**
  * Devin model token pricing for OpenCode cost reporting.
- * Mirrors `cursor-opencode-provider/src/pricing.ts` but uses `DEVIN_MODEL_COSTS`.
+ * Applies the generated Devin model-cost table to OpenCode model entries.
  * Rates come from Devin's public docs when available; generated data lives in
  * `pricing-data.ts`. Unknown models get no `cost`.
  */

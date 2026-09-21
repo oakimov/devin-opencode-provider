@@ -4,7 +4,6 @@
  *
  * OpenCode 1.x: `ToolRegistry.tools` removes `edit`/`write` and advertises
  * `apply_patch` instead when `modelID.includes("gpt-") && !includes("oss") && !includes("gpt-4")`.
- * See `cursor-opencode-provider/src/protocol/apply-patch.ts` for full rationale.
  * Devin keeps sending `edit`/`write`-style tool calls regardless, so without
  * translation every file mutation on a `gpt-5*` model is refused.
  *

@@ -21,10 +21,8 @@ import type {
  * Integration registration for the OpenCode 2.0 plugin — the replacement for the
  * classic plugin's `auth` hook (`methods` + `loader`).
  *
- * Mirrors `cursor-opencode-provider/src/opencode2/integration.ts` structure
- * but uses Devin's PKCE loopback (`app.devin.ai` + `api.devin.ai`) instead
- * of Cursor's `/auth/poll` endpoint. Unlike Cursor's `crsr_` exchange,
- * Devin API keys are passed through to `GetUserJwt` (no `exchangeApiKey`).
+ * Devin uses its PKCE loopback (`app.devin.ai` + `api.devin.ai`). Devin API
+ * keys are passed through to `GetUserJwt` without an intermediate exchange.
  */
 
 export const DEVIN_OAUTH_METHOD_ID = "oauth"

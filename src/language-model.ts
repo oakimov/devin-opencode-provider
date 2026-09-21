@@ -4,12 +4,18 @@ import path from "node:path"
 import type { CreateDevinOptions } from "./index.js"
 import { getCachedUserJwt, resolveBearerToken } from "./auth.js"
 import { devinApiBaseURL } from "./plugin-core.js"
-import { trace } from "./debug.js"
+import { isDebugEnabled, trace } from "./debug.js"
 import type { ChatHistoryItem, ContentPart, ToolDef } from "./protocol/chat.js"
-import { streamChatEvents } from "./protocol/chat.js"
-import { buildLanguageModelV3UsageFromCounters, emptyLanguageModelV3Usage, type DevinUsageCounters } from "./usage.js"
+import { canonicalizeToolDefs, toolsInFixedOrder, streamChatEvents } from "./protocol/chat.js"
+import { fileArgPhrase, hostFilePathKey, normalizeFileToolArgs } from "./protocol/file-tool-args.js"
+import {
+  buildLanguageModelV3UsageFromCounters,
+  emptyLanguageModelV3Usage,
+  formatDevinCacheDiagnostics,
+  formatTurnUsageValidation,
+  type DevinUsageCounters,
+} from "./usage.js"
 import { remapDevinEditForApplyPatchCatalog } from "./protocol/apply-patch-bridge.js"
-import { fileArgPhrase, normalizeFileToolArgs } from "./protocol/file-tool-args.js"
 import { normalizeOpenCodeReadOutput } from "./protocol/read-output.js"
 import { groundToolResultText, isReadToolName } from "./protocol/tool-paths.js"
 import { mutationArgsWithoutContent, partialReadMutationRefusal } from "./protocol/partial-read-guard.js"
@@ -45,6 +51,128 @@ export function opencodeSessionKey(callOptions: LanguageModelV3CallOptions): str
     h["x-opencode-session"]
   if (typeof raw === "string" && raw.trim().length > 0) return raw.trim()
   return undefined
+}
+
+/** Prior-turn usage for warm/cold cache-diagnosis continuity. */
+const priorUsageBySession = new Map<string, DevinUsageCounters>()
+export const MAX_CACHE_DIAGNOSTIC_SESSIONS = 256
+export const MAX_TURN_STATE_SESSIONS = 256
+
+/**
+ * Epoch tool catalog per OpenCode session. First nonempty freeze is UTF-16;
+ * equal names keep frozen descriptors; new names append; shrink advertises
+ * only live names without forgetting their epoch positions. Compaction still
+ * advertises [].
+ */
+const toolCatalogBySession = new Map<string, ToolDef[]>()
+
+function rememberToolCatalog(sessionKey: string, tools: ToolDef[]): void {
+  toolCatalogBySession.delete(sessionKey)
+  toolCatalogBySession.set(sessionKey, structuredClone(tools))
+  while (toolCatalogBySession.size > MAX_TURN_STATE_SESSIONS) {
+    const oldest = toolCatalogBySession.keys().next().value as string | undefined
+    if (!oldest) break
+    toolCatalogBySession.delete(oldest)
+  }
+}
+
+function touchToolCatalog(sessionKey: string): ToolDef[] | undefined {
+  const cached = toolCatalogBySession.get(sessionKey)
+  if (!cached) return undefined
+  toolCatalogBySession.delete(sessionKey)
+  toolCatalogBySession.set(sessionKey, cached)
+  return cached
+}
+
+export function resetTurnToolCatalogForTests(): void {
+  toolCatalogBySession.clear()
+}
+
+/** Drop state only after the host confirms that the session is gone. */
+export function clearTurnStateForSession(sessionKey: string): void {
+  toolCatalogBySession.delete(sessionKey)
+  priorUsageBySession.delete(sessionKey)
+}
+
+/** Plugin teardown must not leave session epochs behind for the next setup. */
+export function clearAllTurnState(): void {
+  toolCatalogBySession.clear()
+  priorUsageBySession.clear()
+}
+
+/**
+ * Advertisement must stay byte-stable across same-set shuffles and grows, or
+ * Devin's tools prefix (GetChatMessageRequest #10) goes cold.
+ *
+ * Every advertised tool is host-executable. Shrink drops names the host
+ * omitted and keeps their epoch positions for when they return. Compaction
+ * and other zero-tool turns advertise [] so the summarizer cannot call tools;
+ * the cached catalog is kept for the next nonempty turn.
+ */
+export function resolveTurnToolState(input: {
+  sessionKey?: string
+  incomingTools: ToolDef[]
+  isCompaction: boolean
+}): { advertisedTools: ToolDef[] } {
+  const { sessionKey, incomingTools, isCompaction } = input
+  if (isCompaction || incomingTools.length === 0) {
+    // A zero-tool lifecycle turn cannot advertise the cached catalog safely,
+    // but it is still session activity. Touch the entry so an active session
+    // is not evicted and forced to re-freeze immediately after compaction.
+    if (sessionKey) touchToolCatalog(sessionKey)
+    return { advertisedTools: [] }
+  }
+  if (!sessionKey) return { advertisedTools: toolsInFixedOrder(incomingTools) }
+
+  const cached = toolCatalogBySession.get(sessionKey)
+  if (cached && cached.length > 0) {
+    const cachedNames = new Set(cached.map((tool) => tool.name))
+    const incomingNames = new Set(incomingTools.map((tool) => tool.name))
+    const hasNew = [...incomingNames].some((name) => !cachedNames.has(name))
+    if (hasNew) {
+      const newcomers = toolsInFixedOrder(
+        incomingTools.filter((tool) => !cachedNames.has(tool.name)),
+      )
+      const epoch = [...cached, ...newcomers]
+      rememberToolCatalog(sessionKey, epoch)
+      return { advertisedTools: epoch.filter((tool) => incomingNames.has(tool.name)) }
+    }
+    touchToolCatalog(sessionKey)
+    return { advertisedTools: cached.filter((tool) => incomingNames.has(tool.name)) }
+  }
+  const initial = toolsInFixedOrder(incomingTools)
+  rememberToolCatalog(sessionKey, initial)
+  return { advertisedTools: initial }
+}
+
+function rememberPriorUsage(sessionKey: string, counters: DevinUsageCounters): void {
+  priorUsageBySession.delete(sessionKey)
+  priorUsageBySession.set(sessionKey, { ...counters })
+  while (priorUsageBySession.size > MAX_CACHE_DIAGNOSTIC_SESSIONS) {
+    const oldest = priorUsageBySession.keys().next().value as string | undefined
+    if (!oldest) break
+    priorUsageBySession.delete(oldest)
+  }
+}
+
+function sha256Hex(value: string): string {
+  return crypto.createHash("sha256").update(value).digest("hex")
+}
+
+function diagnosticFingerprint(value: string): string {
+  return sha256Hex(value).slice(0, 16)
+}
+
+function hostToolDialectLine(tools: ToolDef[]): string {
+  const names = advertisedToolNames(tools)
+  const shellTool = hostShellTool(names)
+  const read = tools.find((t) => t.name === "read" || t.name === "edit" || t.name === "write")
+  const key = read ? hostFilePathKey(read.parameters) : "both"
+  const filePathKey = key === "both" ? (shellTool === "shell" ? "path" : "filePath") : key
+  return (
+    `host tool dialect: filePathKey=${filePathKey} shellTool=${shellTool} ` +
+    `tools=[${tools.map((t) => t.name).join(",")}]`
+  )
 }
 
 function extractSystemPrompt(prompt: LanguageModelV3CallOptions["prompt"]): string | undefined {
@@ -212,8 +340,8 @@ function injectAttachmentsOntoLastUser(
 
 function extractTools(callOptions: LanguageModelV3CallOptions): ToolDef[] {
   const tools = (callOptions as any).tools as Array<{ name: string; description?: string; inputSchema?: unknown }> | undefined
-  if (!Array.isArray(tools)) return []
-  return tools.map(t => {
+  if (!Array.isArray(tools) || tools.length === 0) return []
+  const out = tools.map(t => {
     let description = t.description ?? ""
     // Inject tightened descriptions for the file tools Devin most often misuses.
     // System guidance alone is frequently ignored; the tool's own description is
@@ -237,6 +365,7 @@ function extractTools(callOptions: LanguageModelV3CallOptions): ToolDef[] {
       parameters: schema,
     }
   })
+  return canonicalizeToolDefs(out)
 }
 
 function toolOutputToString(raw: unknown): string {
@@ -387,7 +516,7 @@ async function doStreamImpl(
   const host = options.apiBaseURL ?? devinApiBaseURL()
   const userJwt = await getCachedUserJwt(apiKey, host, callOptions.abortSignal ?? undefined)
 
-  // Resolve wire model id + variant params mirroring cursor's doStream:
+  // Resolve the wire model id and variant parameters from OpenCode options:
   // OpenCode merges model/variant into providerOptions.devin — we must not
   // leak unrelated options onto the wire.
   const rawProviderOptions = (callOptions as unknown as { providerOptions?: unknown }).providerOptions as
@@ -414,7 +543,7 @@ async function doStreamImpl(
     }
   })()
   // OpenCode id is the base (`claude-opus-5`); Devin wire uid is synthesized
-  // from variant params (`claude-opus-5-medium`). Matches Cursor's one-id shape.
+  // from variant params (`claude-opus-5-medium`).
   // Prime the alias table from the model cache so a bare base id resolves to the
   // catalog default wire uid (including opaque PRIVATE_* ids) when the host
   // sends no variant params. Both OpenCode 1.x config and 2.0 inventory already
@@ -494,20 +623,55 @@ async function doStreamImpl(
       attachmentExtraction.attachments.map(attachmentToContentPart),
     )
   }
-  const tools = isCompaction ? [] : extractTools(callOptions)
+  const incomingTools = isCompaction ? [] : extractTools(callOptions)
+  const tools = resolveTurnToolState({ sessionKey, incomingTools, isCompaction }).advertisedTools
+  if (isDebugEnabled() || isCompaction) {
+    trace(
+      `extractTools: ${incomingTools.length} incoming → ${tools.length} advertised [${tools.map((t) => t.name).join(",")}]` +
+        (isCompaction ? " (compaction)" : ""),
+    )
+  }
   const guidance = isCompaction ? undefined : buildDevinOpenCodeGuidance(tools, workspaceRoot)
   if (guidance) {
     const sys = systemPrompt ? `${guidance}\n\n${systemPrompt}` : guidance
     messages = [{ role: "system", content: sys }, ...messages]
-    trace(`devin guidance: workspaceRoot=${workspaceRoot} tools=${[...new Set(tools.map(t => t.name))].join(",")}`)
+    trace(`devin guidance: workspaceRootHash=${diagnosticFingerprint(workspaceRoot)} tools=${[...new Set(tools.map(t => t.name))].join(",")}`)
   } else if (systemPrompt) {
     messages = [{ role: "system", content: systemPrompt }, ...messages]
   }
 
   const cascadeId = sessionKey ?? crypto.randomUUID()
   const promptCacheKey = sessionKey ?? cascadeId
-
-  trace(`devin doStream model=${modelId} wire=${wireModelId} host=${host} msgs=${messages.length} tools=${tools.length} toolNames=${tools.map(t => t.name).join(",")} cascade=${cascadeId.slice(0, 8)} cacheKey=${promptCacheKey.slice(0, 8)}`)
+  const debugEnabled = isDebugEnabled()
+  const systemPromptHash = debugEnabled && systemPrompt ? sha256Hex(systemPrompt) : undefined
+  const prefixHash = debugEnabled
+    ? sha256Hex(JSON.stringify({ workspaceRoot, tools, systemPromptHash, compaction: isCompaction }))
+    : ""
+  if (debugEnabled) {
+    const historyChars = messages.reduce((n, m) => n + JSON.stringify(m).length, 0)
+    const lastUser = [...messages].reverse().find((m) => m.role === "user")
+    const userTextLen = lastUser ? JSON.stringify(lastUser).length : 0
+    const imageBytes = attachmentExtraction?.attachments.reduce((n, a) => n + (a.data?.byteLength ?? 0), 0) ?? 0
+    trace(
+      `outbound Run: model=${wireModelId} opencodeModel=${modelId} ` +
+        `cascadeIdHash=${diagnosticFingerprint(cascadeId)} ` +
+        `promptCacheKeyHash=${diagnosticFingerprint(promptCacheKey)} ` +
+        `systemPromptLen=${systemPrompt?.length ?? 0} ` +
+        `tools=${tools.length} incomingTools=${incomingTools.length} compaction=${isCompaction} ` +
+        `userTextLen=${userTextLen} ` +
+        `images=${attachmentExtraction?.attachments.length ?? 0} ` +
+        `imageBytes=${imageBytes} historyMsgs=${messages.length} historyChars=${historyChars}`,
+    )
+    if (systemPrompt) trace(`hash systemPrompt sha256=${systemPromptHash}`)
+    trace(`hash prefix sha256=${prefixHash}`)
+    trace(hostToolDialectLine(tools))
+  }
+  // Keep the legacy one-liner for greps that still look for `devin doStream`.
+  trace(
+    `devin doStream model=${modelId} wire=${wireModelId} host=${host} msgs=${messages.length} ` +
+      `tools=${tools.length} toolNames=${tools.map((t) => t.name).join(",")} ` +
+      `cascadeHash=${diagnosticFingerprint(cascadeId)} cacheKeyHash=${diagnosticFingerprint(promptCacheKey)}`,
+  )
 
   const stream = new ReadableStream<LanguageModelV3StreamPart>({
     async start(controller) {
@@ -582,6 +746,9 @@ async function doStreamImpl(
 
       const emitToolCall = (toolCallId: string, toolName: string, input: string) => {
         endToolInput(toolCallId)
+        trace(
+          `exec: EMITTED tool-call toolCallId=${toolCallId} toolName=${toolName} inputLen=${input.length}`,
+        )
         controller.enqueue({ type: "tool-call", toolCallId, toolName, input } as unknown as LanguageModelV3StreamPart)
       }
 
@@ -742,13 +909,52 @@ async function doStreamImpl(
       closeToolInputs()
       if ((finishUnified as string) === "other") finishUnified = (toolCalls.size > 0 ? "tool-calls" : "stop") as any
       const finalUsage = hasUsage ? buildLanguageModelV3UsageFromCounters(counters) : emptyLanguageModelV3Usage()
-      // Like cursor's LoggableUsage, expose raw server counters verbatim in providerMetadata
-      // alongside the derived AI SDK usage (input/noCache/cacheRead/cacheWrite). Consumers can
+      // Expose raw server counters verbatim in providerMetadata alongside the
+      // derived AI SDK usage (input/noCache/cacheRead/cacheWrite). Consumers can
       // distinguish warm vs cold by comparing successive turns' cacheRead against prior input.
       const rawCounters = hasUsage ? { inputTokens: counters.inputTokens, outputTokens: counters.outputTokens, cacheRead: counters.cacheRead, cacheWrite: counters.cacheWrite } : undefined
-      if (hasUsage && rawCounters && rawCounters.cacheRead > rawCounters.inputTokens) {
-        trace(`devin final usage (raw snapshot, cacheRead > input): hasUsage=${hasUsage} input=${rawCounters.inputTokens} output=${rawCounters.outputTokens} cacheRead=${rawCounters.cacheRead} — server reports cumulative cached context, not input partition`)
-      } else {
+      const reasonLabel = String(finishUnified)
+      const inTotal = finalUsage.inputTokens?.total ?? 0
+      const outTotal = finalUsage.outputTokens?.total ?? 0
+      if (debugEnabled) trace(
+          `finish: reason=${reasonLabel} ` +
+            `v3In=${inTotal} v3Out=${outTotal} ` +
+            `v3CacheRead=${finalUsage.inputTokens?.cacheRead ?? 0} v3CacheWrite=${finalUsage.inputTokens?.cacheWrite ?? 0} ` +
+            `v3Reasoning=${finalUsage.outputTokens?.reasoning ?? 0} ` +
+            `rawIn=${counters.inputTokens} rawOut=${counters.outputTokens} ` +
+            `rawCacheRead=${counters.cacheRead} rawCacheWrite=${counters.cacheWrite} ` +
+            `source=${hasUsage ? "devin-model-usage" : "unavailable"}`,
+        )
+      if (hasUsage && debugEnabled) {
+        const prior = sessionKey ? priorUsageBySession.get(sessionKey) : undefined
+        trace(formatTurnUsageValidation(counters, finalUsage))
+        trace(
+          formatDevinCacheDiagnostics(counters, {
+            sessionKeyHash: sessionKey ? diagnosticFingerprint(sessionKey) : undefined,
+            cascadeIdHash: diagnosticFingerprint(cascadeId),
+            promptCacheKeyHash: diagnosticFingerprint(promptCacheKey),
+            modelId: wireModelId,
+            prior,
+            prefixHash,
+            systemPromptHash,
+            systemPromptSent: !!systemPrompt,
+            displayToolCalls: toolCalls.size,
+          }),
+        )
+        if (sessionKey) rememberPriorUsage(sessionKey, counters)
+        if (rawCounters && rawCounters.cacheRead > rawCounters.inputTokens) {
+          trace(
+            `devin final usage (raw snapshot, cacheRead > input): hasUsage=${hasUsage} ` +
+              `input=${rawCounters.inputTokens} output=${rawCounters.outputTokens} ` +
+              `cacheRead=${rawCounters.cacheRead} — server reports cumulative cached context, not input partition`,
+          )
+        } else {
+          trace(
+            `devin final usage: hasUsage=${hasUsage} input=${counters.inputTokens} ` +
+              `output=${counters.outputTokens} cacheRead=${counters.cacheRead}`,
+          )
+        }
+      } else if (debugEnabled) {
         trace(`devin final usage: hasUsage=${hasUsage} input=${counters.inputTokens} output=${counters.outputTokens} cacheRead=${counters.cacheRead}`)
       }
       controller.enqueue({

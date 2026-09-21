@@ -1,6 +1,18 @@
 # devin-opencode-provider
 
-OpenCode plugin + AI SDK provider that runs Devin subscription models by speaking Devin's Connect-RPC Cascade protocol (`server.codeium.com`, not a generic chat-completions API). Mirrors `cursor-opencode-provider` structure for OpenCode.
+OpenCode plugin + AI SDK provider that runs Devin subscription models by speaking Devin's Connect-RPC Cascade protocol (`server.codeium.com`, not a generic chat-completions API).
+
+## Non-negotiable provider / compatibility-layer boundary
+
+This package targets **only canonical OpenCode 1.x and OpenCode 2.0 contracts**. Compatibility layers may adapt it externally, but this repository must be completely unaware of them and of every alternate host or sibling provider.
+
+- **No compatibility-layer dependency or identity:** executable source, types, tests, package metadata, and published `dist/` must not import, name, detect, or describe `@opencode-compat/*`, OCP, or any compatibility package.
+- **No alternate-host knowledge:** the same surfaces must not name or parse MiMo, Kilo, Pi, OMP, DSH/DeepSeek Harness, their paths, environment variables, tools, schemas, result envelopes, planning behavior, or session events. Evidence learned from another host must be restated as a Devin backend or canonical OpenCode contract before entering this repository.
+- **No sibling-provider knowledge:** do not import, reference, mirror, alias, or export names belonging to another provider. In particular, this package must never expose another provider's factory/plugin names or point comments at another provider implementation for rationale.
+- **Canonical vocabulary only:** provider runtime code consumes advertised OpenCode tools and schemas. Alternate names and payloads must be normalized by the external compatibility layer before reaching this package. Unknown advertised tools may pass through as opaque catalog data; the provider must never recognize a host-specific tool or result shape.
+- **Neutral structural seams only:** optional host capabilities must be structural, host-neutral OpenCode contracts such as `Symbol.for("opencode.host.path-bridge")`; no installer identity or host branch may be observable.
+- **Documentation exception:** user-facing documentation may explain that an external compatibility layer can adapt the unchanged provider, but that rationale must never become provider executable code, tests, declarations, aliases, or package metadata.
+- **Hard change gate:** after every provider change, build and scan `src/`, tests, `package.json`, lockfile, and published `dist/`, including filenames of ignored files under `dist/`; then inspect `npm pack --dry-run --json`. `test/architecture.test.ts` must fail on compatibility packages, compatibility-generated artifacts, alternate-host vocabulary, and sibling-provider identities. If a compatibility behavior cannot be expressed through canonical OpenCode, implement it in OCP instead.
 
 **Stack:** TypeScript (ESM), Bun for install/test, `tsc` for build. Optional peer: `@opencode-ai/plugin@^1.17.13` (devDependency pinned to `^1.18.16`). Deps: `@ai-sdk/provider@3.0.15`. Devin/Windsurf backend: Connect-RPC `GetCascadeModelConfigs` / `GetUserStatus` / `GetUserJwt` / `GetChatMessage` at `https://server.codeium.com`.
 
@@ -40,3 +52,4 @@ There is **no Cursor-style Max Mode** toggle; **Max** = high effort only.
 - Model list cached under `<host-cache>/devin-models.json`
 - Cache TTL: 24 hours
 - Refreshed on startup when cache is empty but credentials exist
+- **Tool catalog:** first nonempty freeze is UTF-16 by name; equal names keep frozen descriptors and order; new names append (UTF-16 among newcomers); the encoder emits advertised order and only canonicalizes JSON-schema keys. Shrink drops names the host omitted, because every advertised tool is host-executable. Compaction still sends no tools.

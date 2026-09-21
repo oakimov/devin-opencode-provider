@@ -18,7 +18,7 @@ import {
  *
  * Devin exposes flat `model_uid`s (`claude-opus-5-medium`, `…-low-fast`, …).
  * We collapse effort/speed/thinking suffixes into ONE OpenCode base id with
- * parameter-only variants (Cursor shape). The language model reconstructs the
+ * parameter-only variants. The language model reconstructs the
  * wire uid from base + `devinVariantParameters` at request time — variants
  * must never carry a second model id or the catalog looks flat again.
  *
@@ -519,7 +519,7 @@ function compareVariantNames(a: string, b: string): number {
     const db = kb[i] as number
     if (da !== db) return da - db
   }
-  return ka[4].localeCompare(kb[4])
+  return ka[4] < kb[4] ? -1 : ka[4] > kb[4] ? 1 : 0
 }
 
 /**
@@ -657,7 +657,7 @@ export function modelsToConfig(models: ModelInfo[]): Record<string, any> {
     baseConfig.name = baseDisplay
     baseConfig.reasoning = supportsReasoning
 
-    // Build variants map — Cursor shape: parameters only, one OpenCode model id.
+    // Build variants map: parameters only, one OpenCode model id.
     // Wire uid is resolved via alias table (opaque PRIVATE_*) or suffix synthesis.
     const hasThinkingSibling = members.some(
       (mm) => mm.variantName === "Thinking" || /(^|\s)Thinking$/i.test(mm.variantName ?? ""),

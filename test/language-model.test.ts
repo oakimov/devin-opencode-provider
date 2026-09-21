@@ -327,6 +327,13 @@ describe("buildDevinOpenCodeGuidance", () => {
     expect(guids(["read"])).toContain("Emit the actual tool call and wait for its result")
   })
 
+  it("does not invent a plan lifecycle when no plan tools are advertised", () => {
+    const g = guids(["read", "bash", "question"])
+    expect(g).not.toContain("plan mode")
+    expect(g).not.toContain("plan_enter")
+    expect(g).not.toContain("plan_exit")
+  })
+
   it("escapes workspace root JSON", () => {
     const g = guids(["read"], "/tmp/my ws")
     expect(g).toContain(JSON.stringify("/tmp/my ws"))

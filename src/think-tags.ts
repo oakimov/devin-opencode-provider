@@ -5,9 +5,9 @@
  * models still emit the XML tags on #3 (visible text). Passing those through
  * as text-delta is what surfaces a literal `</think>` in OpenCode.
  *
- * Algorithm matches cursor_mock/llm/client.py `_feed_think_tags` (cross-chunk
- * hold of partial tags) plus stray `</think>` with no matching open: drop the
- * tag, and treat any prefix as reasoning until the first visible text.
+ * The parser holds partial tags across chunks. For a stray `</think>` with no
+ * matching open, it drops the tag and treats any prefix as reasoning until the
+ * first visible text.
  */
 
 export const THINK_OPEN = "<think>"

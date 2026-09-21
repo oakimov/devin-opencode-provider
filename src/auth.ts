@@ -3,7 +3,7 @@ import * as crypto from "node:crypto"
 import { withAbortDeadline } from "./deadline.js"
 import { WINDSURF_API_HOST, DEVIN_API_HOST, DEVIN_WEBSITE_HOST, WINDSURF_REGISTER_HOST, WINDSURF_OAUTH_CLIENT_ID, WINDSURF_WEBSITE_HOST } from "./shared.js"
 import { buildMetadata } from "./protocol/metadata.js"
-import { concat, encodeMessage, iterFields } from "./protocol/wire.js"
+import { encodeMessage, iterFields } from "./protocol/wire.js"
 
 const API_BASE = `https://${WINDSURF_API_HOST}`
 const DEVIN_AUTH_BASE = `https://${DEVIN_API_HOST}`
@@ -41,8 +41,8 @@ export function decodeJwtExpiryMs(jwt: string): number | null {
 }
 
 // Windsurf uses long-lived api_key (sk-ws-01-xxx, cog_xxx, devin-session-token$xxx)
-// and mints short-lived user_jwt via GetUserJwt for each chat. No exchange needed
-// for apiKey -> access token like Cursor; but we keep similar resolve interface.
+// and mints short-lived user_jwt via GetUserJwt for each chat. No intermediate
+// API-key exchange is needed; the resolver still exposes one token interface.
 
 export type TokenPair = { accessToken: string; refreshToken?: string }
 
@@ -113,7 +113,7 @@ export function clearCachedUserJwt(): void {
 export async function resolveBearerToken(input: { accessToken?: string; apiKey?: string; baseUrl?: string }): Promise<string> {
   if (input.accessToken) return input.accessToken
   if (!input.apiKey) throw new Error("Devin provider: no access token or API key provided")
-  // Windsurf api keys are not exchanged like Cursor's crsr_... ; return as-is for GetUserJwt mint
+  // Windsurf API keys pass through for the later GetUserJwt mint.
   // But if it looks like a JWT already, return it
   if (input.apiKey.startsWith("eyJ")) return input.apiKey
   return input.apiKey
@@ -140,7 +140,7 @@ export async function generatePkceChallenge(verifier: string): Promise<string> {
   return base64url(hash)
 }
 export function buildLoginUrl(challenge: string, uuid: string, websiteUrl = `https://${WINDSURF_WEBSITE_HOST}`): string {
-  // Cursor-style deep control (kept for compat); Windsurf uses implicit grant below
+  // Legacy deep-control login; Windsurf uses the implicit grant below.
   return `${websiteUrl}/loginDeepControl?challenge=${encodeURIComponent(challenge)}&uuid=${encodeURIComponent(uuid)}&mode=login&redirectTarget=cli`
 }
 
@@ -171,7 +171,7 @@ export function buildWindsurfLoginUrl(state: string, port: number, websiteUrl = 
 }
 
 // ── Devin OAuth PKCE (app.devin.ai + api.devin.ai) ──
-// Verified via prime-agent issue #753 / omp implementation and Devin decompiled workbench
+// Verified against Devin's CLI authentication flow and decompiled workbench.
 // Authorize: https://app.devin.ai/auth/cli/continue?redirect_uri=...&state=...&prompt=select_account&code_challenge=...&code_challenge_method=S256
 // Token: POST https://api.devin.ai/auth/cli/token { code, code_verifier } → { token }
 
@@ -362,7 +362,7 @@ export async function pollForDevinTokens(opts: { state: string; server: Loopback
   const { token } = await exchangeDevinCode({ code, codeVerifier: opts.codeVerifier, apiBaseUrl: opts.apiBaseUrl, signal: opts.signal })
   // Normalize to devin-session-token$<jwt> if needed; api.devin.ai returns a JWT
   if (token.startsWith("devin-session-token$") || token.startsWith("cog_") || token.startsWith("sk-")) return { token }
-  // If raw JWT, prefix as session token for consistency with omp
+  // Normalize a raw JWT into the Devin session-token form expected downstream.
   if (token.startsWith("eyJ")) return { token: `devin-session-token$${token}` }
   return { token }
 }

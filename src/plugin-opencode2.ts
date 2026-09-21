@@ -25,6 +25,7 @@ import { clearSessionTodos, clearAllSessionTodos } from "./todo-store.js"
 import { clearCompactionSessions, markCompactionSession } from "./compaction-marker.js"
 import { clearSessionDirectories, clearSessionDirectory, markSessionDirectory } from "./session-directory.js"
 import { DevinPlugin } from "./plugin.js"
+import { clearAllTurnState, clearTurnStateForSession } from "./language-model.js"
 import type { CreateDevinOptions } from "./index.js"
 import type {
   Cleanup,
@@ -544,6 +545,7 @@ const plugin: Plugin2 & { server: typeof DevinPlugin } = {
       clearCompactionSessions()
       clearSessionDirectories()
       clearAllSessionTodos()
+      clearAllTurnState()
       clearDevinShellTracking()
       for (const registration of registrations.reverse()) {
         await registration.dispose().catch(() => {})
@@ -608,6 +610,7 @@ function applySessionActivity(event: unknown, onCredentialSwitch?: () => void): 
         clearSessionTodos(id)
         markCompactionSession(id, false)
         clearSessionDirectory(id)
+        clearTurnStateForSession(id)
       }
       break
     }

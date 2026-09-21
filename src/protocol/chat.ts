@@ -1,6 +1,6 @@
 import * as crypto from "node:crypto"
 import * as zlib from "node:zlib"
-import { concat, encodeMessage, encodeString, encodeVarintField, frameEnvelope, iterFields, parseConnectFrames } from "./wire.js"
+import { concat, encodeMessage, encodeString, encodeVarintField, frameEnvelope, iterFields } from "./wire.js"
 import { buildMetadata } from "./metadata.js"
 import { trace } from "../debug.js"
 import { DevinProviderError } from "../errors.js"
@@ -24,6 +24,53 @@ export type ToolDef = {
   name: string
   description: string
   parameters: unknown
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0
+}
+
+function canonicalizeJsonValue(value: unknown, ancestors: Set<object>): unknown {
+  if (value === null || typeof value !== "object") return value
+  if (ancestors.has(value)) throw new TypeError("Converting circular structure to JSON")
+  ancestors.add(value)
+  try {
+    if (Array.isArray(value)) {
+      return value.map((entry) => canonicalizeJsonValue(entry, ancestors))
+    }
+    const record = value as Record<string, unknown>
+    const canonical: Record<string, unknown> = {}
+    for (const key of Object.keys(record).sort(compareCodeUnits)) {
+      canonical[key] = canonicalizeJsonValue(record[key], ancestors)
+    }
+    return canonical
+  } finally {
+    ancestors.delete(value)
+  }
+}
+
+/**
+ * Canonicalize JSON-schema property insertion order. Tool list order is the
+ * advertised epoch order from `resolveTurnToolState` — do not re-sort here or
+ * a grow that appends `bash` after `write` gets rewritten to `bash, write`
+ * and retokenizes the tools prefix.
+ */
+export function canonicalizeToolDefs(tools: readonly ToolDef[]): ToolDef[] {
+  return tools.map((tool) => ({
+    ...tool,
+    parameters: canonicalizeJsonValue(tool.parameters ?? {}, new Set<object>()),
+  }))
+}
+
+/** UTF-16 name order for the first catalog freeze and for newcomers only. */
+export function toolsInFixedOrder<T extends { name?: string }>(tools: readonly T[]): T[] {
+  return tools
+    .map((tool) => ({ ...tool }))
+    .sort((left, right) => {
+      const a = left.name ?? ""
+      const b = right.name ?? ""
+      return a < b ? -1 : a > b ? 1 : 0
+    })
 }
 
 export type CloudChatEvent =
@@ -303,7 +350,8 @@ export function buildGetChatMessageRequest(args: BuildArgs): Uint8Array {
     },
   )))
   const completion = encodeCompletionConfiguration(args.completionOpts ?? {})
-  const toolParts: Uint8Array[] = (args.tools ?? []).map(t => encodeMessage(10, encodeToolDef(t)))
+  const toolParts: Uint8Array[] = canonicalizeToolDefs(args.tools ?? [])
+    .map(t => encodeMessage(10, encodeToolDef(t)))
   const cacheKey = (args.promptCacheKey || args.cascadeId || args.sessionId).trim()
   const executionId = (args.executionId || args.promptId).trim()
   return concat(
@@ -470,6 +518,7 @@ export async function* streamChatEvents(req: {
     triggerId: crypto.randomUUID(),
   })
   const body = frameConnectStream(proto, true)
+  trace(`GetChatMessage protoBytes=${proto.length} framedBytes=${body.length}`)
   let resp: Response
   try {
     resp = await fetch(`${host}/exa.api_server_pb.ApiServerService/GetChatMessage`, {

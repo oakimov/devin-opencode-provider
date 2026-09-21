@@ -68,15 +68,6 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
 
   let sessionAccessToken: string | undefined
 
-  async function persistAuth(body: Auth): Promise<void> {
-    await input.client.auth.set({ path: { id: DEVIN_PROVIDER_ID }, body })
-  }
-  async function persistAuthBestEffort(body: Auth): Promise<void> {
-    try { await persistAuth(body) } catch (e) {
-      const err = e as Error
-      trace(`persistAuthBestEffort: failed to persist auth: ${err.message}`)
-    }
-  }
   async function authFromStore(): Promise<Auth | StoredAuth | undefined> {
     return readStoredAuth(DEVIN_PROVIDER_ID)
   }
@@ -328,6 +319,5 @@ export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
   }
 }
 
-// Back-compat aliases moved to devin-opencode-provider/compat subpath
-// so the package root stays plugin-safe and pi-bridge auto-detect works
-// with a single `DevinPlugin` export (like cursor's single `CursorPlugin`).
+// Back-compat Windsurf aliases live on the package's `compat` subpath so the
+// package root stays plugin-safe with one `DevinPlugin` export.

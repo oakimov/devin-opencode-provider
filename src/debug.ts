@@ -3,12 +3,20 @@ import os from "node:os"
 import path from "node:path"
 
 // Wire-level diagnostics. Opt in with DEVIN_PROVIDER_DEBUG=1 (or "true").
-// Default path mirrors Cursor CLI: $TMPDIR/devin-provider-logs-<uid>/debug-<pid>.log
+// Managed default: $TMPDIR/devin-provider-logs-<uid>/debug-<pid>.log
 // with directory mode 0o700 and file mode 0o600. Override with DEVIN_PROVIDER_DEBUG_FILE.
-// Truncated once per process. Tokens / checksums should be redacted by callers.
+// First init in a fresh file writes a header; later inits (module reload / second
+// isolate sharing DEVIN_PROVIDER_DEBUG_FILE) append another header instead of
+// wiping earlier lines. Operators who want a clean run should truncate the
+// override path before starting the host. Independently, when the file reaches
+// DEBUG_LOG_MAX_BYTES it is size-capped (truncated + new header) so debug runs
+// cannot grow without bound. Tokens / checksums: redact in callers.
 const DEBUG_ENABLED =
   process.env.DEVIN_PROVIDER_DEBUG === "1" ||
   process.env.DEVIN_PROVIDER_DEBUG === "true"
+
+/** Soft cap for the debug log file; exceeded size triggers truncate + new header. */
+export const DEBUG_LOG_MAX_BYTES = 10 * 1024 * 1024
 
 let _traceInitialized = false
 let _debugFile: string | undefined
@@ -30,7 +38,8 @@ export function resolveDebugLogPath(): string {
 }
 
 /**
- * Ensure the log directory is 0o700 and create/truncate the log file as 0o600.
+ * Ensure the log directory is 0o700 and the log file exists as 0o600.
+ * Does **not** truncate an existing file — mid-run re-init must keep prior lines.
  * Exported for tests; callers normally go through `trace`.
  */
 export function ensureSecureDebugLog(
@@ -52,7 +61,9 @@ export function ensureSecureDebugLog(
     }
     fs.chmodSync(dir, 0o700)
   }
-  fs.writeFileSync(filePath, "", { mode: 0o600 })
+  if (!fs.existsSync(filePath)) {
+    fs.writeFileSync(filePath, "", { mode: 0o600 })
+  }
   fs.chmodSync(filePath, 0o600)
 }
 
@@ -67,6 +78,32 @@ function announceLogPath(filePath: string): void {
   }
 }
 
+function debugBannerLine(): string {
+  return `--- devin-provider debug (pid ${process.pid}) ${new Date().toISOString()} ---\n`
+}
+
+/**
+ * If `filePath` is at least `maxBytes`, truncate it and write a size-cap header.
+ * Returns true when a truncate happened. Exported for tests.
+ */
+export function truncateDebugLogIfOversized(
+  filePath: string,
+  maxBytes: number = DEBUG_LOG_MAX_BYTES,
+): boolean {
+  if (!fs.existsSync(filePath)) return false
+  const size = fs.statSync(filePath).size
+  if (size < maxBytes) return false
+  fs.writeFileSync(
+    filePath,
+    debugBannerLine() +
+      `[${new Date().toISOString()}] debug: size-cap truncate ` +
+      `wasBytes=${size} maxBytes=${maxBytes}\n`,
+    { mode: 0o600 },
+  )
+  fs.chmodSync(filePath, 0o600)
+  return true
+}
+
 export function trace(msg: string): void {
   if (!DEBUG_ENABLED) return
   try {
@@ -76,29 +113,28 @@ export function trace(msg: string): void {
     }
     if (!_traceInitialized) {
       ensureSecureDebugLog(_debugFile, { secureParent: _debugFileUsesManagedDirectory })
-      fs.writeFileSync(
-        _debugFile,
-        `--- devin-provider debug (pid ${process.pid}) ${new Date().toISOString()} ---\n`,
-        { mode: 0o600 },
-      )
+      // Drop oversized leftovers from a prior run before appending a reinit banner.
+      truncateDebugLogIfOversized(_debugFile)
+      const banner = debugBannerLine()
+      const preexisting =
+        fs.existsSync(_debugFile) && fs.statSync(_debugFile).size > 0
+      if (preexisting) {
+        fs.appendFileSync(_debugFile, banner)
+      } else {
+        fs.writeFileSync(_debugFile, banner, { mode: 0o600 })
+      }
       _traceInitialized = true
       announceLogPath(_debugFile)
       fs.appendFileSync(
         _debugFile,
-        `[${new Date().toISOString()}] debug: enabled file=${_debugFile} ` +
-          `xdg_cache_home=${process.env.XDG_CACHE_HOME ?? "(unset)"} ` +
-          `cwd=${process.cwd()}\n`,
+        `[${new Date().toISOString()}] debug: enabled` +
+          (preexisting ? " reinit=append" : "") +
+          `\n`,
       )
     }
+    truncateDebugLogIfOversized(_debugFile)
     fs.appendFileSync(_debugFile, `[${new Date().toISOString()}] ${msg}\n`)
   } catch {
     /* ignore */
   }
-}
-
-export function traceRequestContextPaths(label: string, requestContext: Record<string, unknown> | undefined): void {
-  if (!DEBUG_ENABLED) return
-  const env = requestContext?.env && typeof requestContext.env === "object" ? (requestContext.env as Record<string, unknown>) : undefined
-  const mcp = requestContext?.mcp_file_system_options && typeof requestContext.mcp_file_system_options === "object" ? (requestContext.mcp_file_system_options as Record<string, unknown>) : undefined
-  trace(`${label}: workspace_paths=${JSON.stringify(env?.workspace_paths ?? null)} process_working_directory=${JSON.stringify(env?.process_working_directory ?? null)} project_folder=${JSON.stringify(env?.project_folder ?? null)} terminals_folder=${JSON.stringify(env?.terminals_folder ?? null)} agent_transcripts_folder=${JSON.stringify(env?.agent_transcripts_folder ?? null)} workspace_project_dir=${JSON.stringify(mcp?.workspace_project_dir ?? null)}`)
 }

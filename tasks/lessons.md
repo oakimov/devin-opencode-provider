@@ -4,6 +4,18 @@ This directory contains development notes and lessons learned during development
 
 ## Lessons learned
 
+### Debug log lifecycle
+- Mid-run module reload must **append** to `DEVIN_PROVIDER_DEBUG_FILE`
+  (`reinit=append`), not truncate — otherwise earlier lines disappear while
+  the host transcript still has them.
+- Cap the file at 10 MiB: `trace` size-caps with `debug: size-cap truncate`
+  so unbounded debug runs cannot fill disk. Operators truncate once before a
+  clean run.
+- Self-verify greps `outbound Run:`, `extractTools:`, `EMITTED tool-call`,
+  `turn usage validation:`, `cache diagnosis:` with `perModelCallCache=unavailable`.
+  Keep those prefixes stable. Do not invent RequestContext, skills, or
+  checkpoint fields on the Devin lines.
+
 ### Usage parsing
 - Devin sends usage data in frame #7 (ModelUsageStats) and frame #28 (ResponseStatistics)
 - Need to decode both and map to LanguageModelV3Usage
@@ -72,3 +84,13 @@ for 24h → OpenCode opened with Devin uninitialized (no models). Fix: empty
 caches are never fresh; refuse to write empty; discovery returning 0 throws
 so stale non-empty cache can still be served. Delete
 `~/.cache/opencode/devin-models.json` once to recover immediately.
+
+### Tool catalog sort/hold (2026-09-21)
+- Do not re-sort tools on every encode. JSON-schema keys stay UTF-16
+  canonicalized; list order is the advertised epoch.
+- First nonempty freeze is UTF-16 by name. Equal names keep frozen
+  descriptors. New names append (UTF-16 among newcomers). Re-sorting a
+  grow that appends `bash` after `write` retokenizes the tools prefix.
+- Shrink drops omitted names, because every advertised tool is
+  host-executable. Compaction still sends `tools=[]` so the summarizer
+  cannot call tools.

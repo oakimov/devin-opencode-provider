@@ -1,9 +1,8 @@
 /**
  * Synthesis of OpenCode `apply_patch` envelopes from Devin’s native write/edit tool calls.
  *
- * Mirrors `cursor-opencode-provider/src/protocol/apply-patch.ts` for Devin.
- * See that file for the full upstream rationale (OpenCode 1.x `ToolRegistry.tools`
- * removes `edit`/`write` for `gpt-` models and advertises `apply_patch` instead).
+ * OpenCode 1.x `ToolRegistry.tools` may remove `edit`/`write` and advertise
+ * `apply_patch` instead for a model catalog.
  *
  * This module is host-neutral: it only builds patch text. Whether to apply it
  * is decided by the caller based on the advertised catalog for the current turn.

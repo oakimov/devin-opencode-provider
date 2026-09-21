@@ -25,7 +25,6 @@ export default DevinPlugin
 // treats package-root exports as potential plugins, so extra public runtime
 // APIs belong on subpaths such as "devin-opencode-provider/errors".
 //
-// Windsurf/Cursor aliases are retained for back-compat on subpath
-// "devin-opencode-provider/compat" — see src/compat.ts — but are NOT
-// re-exported here so pi-bridge's `createXxx` / `*Plugin` auto-detection
-// sees a single factory and a single plugin, like cursor-opencode-provider.
+// Windsurf aliases are retained for back-compat on the package's `compat`
+// subpath, but are not re-exported here so generic plugin loaders see one
+// factory and one plugin.

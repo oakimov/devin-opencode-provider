@@ -72,4 +72,4 @@ Unset `DEVIN_OPENCODE2_DEV_ENTRY` in production. Rebuild after every change (`bu
 | — | `credential.switched` drops the cached token, removes the previous model inventory, and reloads |
 | Package root / `plugin` | OpenCode 2 `Host.resolve` loads `exports["./server"]` → this entry (`{ id, setup }`). The same module dual-exports `server: DevinPlugin` so OpenCode 1.18 still gets the classic plugin. |
 
-This port is shared 2.0 host-compat only. It does not invent a host todo TUI, Cursor SwitchMode, plan-exit kickoff, or Exa `cursor-exa`.
+This port implements only the documented OpenCode 2.0 surface. It does not invent host-specific mode switches, plan-exit kickoffs, or private tool providers.
