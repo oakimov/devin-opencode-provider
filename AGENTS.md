@@ -14,15 +14,17 @@ This package targets **only canonical OpenCode 1.x and OpenCode 2.0 contracts**.
 - **Documentation exception:** user-facing documentation may explain that an external compatibility layer can adapt the unchanged provider, but that rationale must never become provider executable code, tests, declarations, aliases, or package metadata.
 - **Hard change gate:** after every provider change, build and scan `src/`, tests, `package.json`, lockfile, and published `dist/`, including filenames of ignored files under `dist/`; then inspect `npm pack --dry-run --json`. `test/architecture.test.ts` must fail on compatibility packages, compatibility-generated artifacts, alternate-host vocabulary, sibling-provider identities, static `@opencode-ai/plugin` value imports in classic plugin modules, and `@opencode/plugin` dependencies. Run `bun run check:pricing` (fixture is empty while `pricing-data.ts` is stubbed). If a compatibility behavior cannot be expressed through canonical OpenCode, implement it in OCP instead.
 
-**Stack:** TypeScript (ESM), Bun for install/test, `tsc` for build. Optional peer: `@opencode-ai/plugin@^1.17.13` (devDependency pinned to `^1.18.16`). Deps: `@ai-sdk/provider@3.0.15`. Devin/Windsurf backend: Connect-RPC `GetCascadeModelConfigs` / `GetUserStatus` / `GetUserJwt` / `GetChatMessage` at `https://server.codeium.com`. Quality gates: `bun run typecheck`, `bun test` (includes architecture), `bun run check:pricing`. No ESLint/Biome — TypeScript + domain tests are the linter.
+**Stack:** TypeScript (ESM), Bun for install/test, `tsc` for build. Optional peer: `@opencode-ai/plugin@^1.17.13` (devDependency pinned to `^1.18.16`). Deps: `@ai-sdk/provider@3.0.15`. Devin/Windsurf backend: Connect-RPC `GetCliModelConfigs` / `GetCascadeModelConfigs` / `GetUserStatus` / `GetUserJwt` / `GetChatMessage` / `AssignModel` at `https://server.codeium.com`. Quality gates: `bun run typecheck`, `bun test` (includes architecture), `bun run check:pricing`. No ESLint/Biome — TypeScript + domain tests are the linter.
 
 ## Provider behavior
 
 - **Provider ID**: `devin`
-- **Authentication**: OAuth PKCE via `api.devin.ai` or API key
-- **Model discovery**: Fetched from Devin's `GetCascadeModelConfigs` API
-- **Streaming**: Full streaming with text, reasoning, and tool calls
-- **Usage**: Token counts extracted from Devin's `ModelUsageStats` frames
+- **Authentication**: OAuth PKCE via `api.devin.ai` or API key. `GetUserJwt` field 2 `customApiServerUrl` becomes the Cascade host unless `DEVIN_API_BASE_URL` (or legacy `WINDSURF_API_BASE_URL`) is set.
+- **Client identity**: default is the released Devin CLI (`ideName=devin-cli`, `ideType=chisel`, `3000.6.2`). `DEVIN_CLIENT_IDENTITY=windsurf` restores the Desktop / Windsurf metadata (`1.48.2` / `3.6.27`). Discovery calls `GetCliModelConfigs` first with the dev-channel identity (`chisel` / `0.0.0-dev`) and display slots 3, 4, 6, 7, 8. Metadata `apiKey` is prefixed `devin-session-token$`. `userJwt` is Metadata field 21.
+- **Model discovery**: CLI identity prefers `GetCliModelConfigs`, then `GetCascadeModelConfigs`, then `GetUserStatus`. Routers with an empty harness list (`requiresAssignModel`) stay standalone bases. Router-flagged configs that carry harness uids are omitted. Display slots 4 and 6 are hidden. `subagent-default` stays hidden.
+- **AssignModel**: before `GetChatMessage`, a router model is resolved with the same `cascadeId`. The chat request sends the assigned uid (`#21`) and `modelAssignmentJwt` (`#26`). Failure fails the turn. `actualModelUid` (`#23`) is copied onto `providerMetadata.devin`.
+- **Streaming**: Full streaming with text, reasoning, and tool calls. System prompt cache options are EPHEMERAL (`#13`) in addition to stable `prompt_cache_key` (`#27`).
+- **Usage**: Token counts extracted from Devin's `ModelUsageStats` frames. Per-turn `creditCost` / `committedCreditCost` / `committedAcuCost` and a non-blocking `GetUserStatus` seat snapshot are `providerMetadata.devin` fields (and `DEVIN_PROVIDER_DEBUG` lines `seat status:` / `turn credits:`). Gemini wire uids strip nullable JSON Schema type unions before tool encode. An early `invalid_argument` trailer whose message contains `internal error`, before any output, with shrinkable history ≥ 512 KiB, becomes a non-retryable `prompt is too long` / `context_length_exceeded` error.
 
 ## Supported features
 

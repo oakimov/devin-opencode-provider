@@ -1,9 +1,10 @@
 import * as crypto from "node:crypto"
 import * as zlib from "node:zlib"
 import { concat, encodeMessage, encodeString, encodeVarintField, frameEnvelope, iterFields } from "./wire.js"
-import { buildMetadata } from "./metadata.js"
+import { buildMetadata, cascadeConnectHeaders } from "./metadata.js"
+import { normalizeToolSchemaForGemini } from "./gemini-schema.js"
 import { trace } from "../debug.js"
-import { DevinProviderError } from "../errors.js"
+import { DevinProviderError, devinContextOverflowError } from "../errors.js"
 
 export type ContentPart =
   | { type: "text"; text: string }
@@ -88,6 +89,13 @@ export type CloudChatEvent =
       cacheReadTokens?: number
       cacheWriteTokens?: number
     }
+  | {
+      kind: "credits"
+      creditCost?: number
+      committedCreditCost?: number
+      committedAcuCost?: number
+    }
+  | { kind: "actual_model"; uid: string }
 
 function encodeImageData(img: { mimeType: string; base64Data: string; caption?: string }): Uint8Array {
   const parts: Uint8Array[] = [
@@ -335,6 +343,15 @@ type BuildArgs = {
   tools?: ToolDef[]
   requestType?: number
   completionOpts?: { maxOutputTokens?: number; temperature?: number; topP?: number; topK?: number }
+  /** `GetChatMessageRequest.#26`, set after a successful AssignModel. */
+  modelAssignmentJwt?: string
+  /** Collapse nullable JSON Schema unions before encoding tools. */
+  normalizeGeminiTools?: boolean
+}
+
+/** `PromptCacheOptions.type = EPHEMERAL` (`GetChatMessageRequest.#13`). */
+function encodeEphemeralPromptCache(): Uint8Array {
+  return encodeMessage(13, encodeVarintField(1, 1))
 }
 
 export function buildGetChatMessageRequest(args: BuildArgs): Uint8Array {
@@ -350,8 +367,14 @@ export function buildGetChatMessageRequest(args: BuildArgs): Uint8Array {
     },
   )))
   const completion = encodeCompletionConfiguration(args.completionOpts ?? {})
-  const toolParts: Uint8Array[] = canonicalizeToolDefs(args.tools ?? [])
-    .map(t => encodeMessage(10, encodeToolDef(t)))
+  let toolDefs = canonicalizeToolDefs(args.tools ?? [])
+  if (args.normalizeGeminiTools) {
+    toolDefs = toolDefs.map((tool) => ({
+      ...tool,
+      parameters: normalizeToolSchemaForGemini(tool.parameters),
+    }))
+  }
+  const toolParts: Uint8Array[] = toolDefs.map(t => encodeMessage(10, encodeToolDef(t)))
   const cacheKey = (args.promptCacheKey || args.cascadeId || args.sessionId).trim()
   const executionId = (args.executionId || args.promptId).trim()
   return concat(
@@ -360,15 +383,59 @@ export function buildGetChatMessageRequest(args: BuildArgs): Uint8Array {
     encodeVarintField(7, args.requestType ?? 5),
     encodeMessage(8, completion),
     ...toolParts,
+    encodeEphemeralPromptCache(),
     encodeString(16, args.cascadeId),
     encodeString(17, args.promptId), // prompt_id (was wrongly on #22)
     encodeString(21, args.modelUid),
     encodeString(22, executionId), // execution_id
+    ...(args.modelAssignmentJwt ? [encodeString(26, args.modelAssignmentJwt)] : []),
     ...(cacheKey ? [encodeString(27, cacheKey)] : []),
   )
 }
 
+/** Encoded history the server can shrink, excluding the active user tail. ~512 KiB is the overflow heuristic. */
+export const LARGE_HISTORY_OVERFLOW_BYTES = 512 * 1024
+
+export function shrinkableHistoryBytes(request: Uint8Array): number {
+  const prompts: Uint8Array[] = []
+  for (const field of iterFields(request)) {
+    if (field.num === 3 && field.wire === 2 && field.value instanceof Uint8Array) prompts.push(field.value)
+  }
+  if (prompts.length === 0) return 0
+  let end = prompts.length
+  const last = prompts[prompts.length - 1]!
+  let source: number | undefined
+  for (const inner of iterFields(last)) {
+    if (inner.num === 2 && inner.wire === 0) source = Number(inner.value)
+  }
+  if (source === 1) end -= 1
+  let bytes = 0
+  for (let i = 0; i < end; i++) bytes += prompts[i]!.length
+  return bytes
+}
+
+export function isLargeHistoryOverflow(input: {
+  code?: string
+  message: string
+  historyBytes: number
+  emittedOutput: boolean
+  threshold?: number
+}): boolean {
+  if (input.emittedOutput) return false
+  if ((input.code ?? "").toLowerCase() !== "invalid_argument") return false
+  if (!/\binternal error\b/i.test(input.message)) return false
+  return input.historyBytes >= (input.threshold ?? LARGE_HISTORY_OVERFLOW_BYTES)
+}
+
+function readDouble(bytes: Uint8Array): number {
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getFloat64(0, true)
+}
+
 export function* decodeChatFrame(proto: Uint8Array): Generator<CloudChatEvent> {
+  let creditCost: number | undefined
+  let committedCreditCost: number | undefined
+  let committedAcuCost: number | undefined
+  let sawCredit = false
   for (const f of iterFields(proto)) {
     if (f.num === 3 && f.wire === 2 && f.value instanceof Uint8Array) {
       const s = new TextDecoder().decode(f.value)
@@ -425,11 +492,31 @@ export function* decodeChatFrame(proto: Uint8Array): Generator<CloudChatEvent> {
           cachedTokens: cacheRead,
         }
       }
+    } else if (f.num === 14 && f.wire === 0) {
+      creditCost = Number(f.value)
+      sawCredit = true
+    } else if (f.num === 18 && f.wire === 0) {
+      committedCreditCost = Number(f.value)
+      sawCredit = true
+    } else if (f.num === 22 && f.wire === 1 && f.value instanceof Uint8Array && f.value.byteLength >= 8) {
+      committedAcuCost = readDouble(f.value)
+      sawCredit = true
+    } else if (f.num === 23 && f.wire === 2 && f.value instanceof Uint8Array) {
+      const uid = new TextDecoder().decode(f.value).trim()
+      if (uid) yield { kind: "actual_model", uid }
     } else if (f.num === 28 && f.wire === 2 && f.value instanceof Uint8Array) {
       // Response Statistics — contains aggregated usage in some captures, but primary is #7.
       // Parse #28 as fallback: look for nested #2 entries with metric_id
       const usage = decodeUsageBlock(f.value)
       if (usage) yield usage
+    }
+  }
+  if (sawCredit) {
+    yield {
+      kind: "credits",
+      ...(creditCost !== undefined ? { creditCost } : {}),
+      ...(committedCreditCost !== undefined ? { committedCreditCost } : {}),
+      ...(committedAcuCost !== undefined && Number.isFinite(committedAcuCost) ? { committedAcuCost } : {}),
     }
   }
 }
@@ -498,6 +585,8 @@ export async function* streamChatEvents(req: {
   promptCacheKey?: string
   signal?: AbortSignal
   userJwt: string
+  modelAssignmentJwt?: string
+  normalizeGeminiTools?: boolean
 }): AsyncGenerator<CloudChatEvent> {
   const host = (req.apiServerUrl ?? "https://server.codeium.com").replace(/\/$/, "")
   const cascadeId = req.cascadeId ?? crypto.randomUUID()
@@ -516,6 +605,8 @@ export async function* streamChatEvents(req: {
     promptCacheKey: req.promptCacheKey ?? cascadeId,
     requestId: BigInt(Date.now()),
     triggerId: crypto.randomUUID(),
+    modelAssignmentJwt: req.modelAssignmentJwt,
+    normalizeGeminiTools: req.normalizeGeminiTools,
   })
   const body = frameConnectStream(proto, true)
   trace(`GetChatMessage protoBytes=${proto.length} framedBytes=${body.length}`)
@@ -523,12 +614,7 @@ export async function* streamChatEvents(req: {
   try {
     resp = await fetch(`${host}/exa.api_server_pb.ApiServerService/GetChatMessage`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/connect+proto",
-        "Connect-Protocol-Version": "1",
-        "Connect-Content-Encoding": "gzip",
-        "Connect-Accept-Encoding": "gzip",
-      },
+      headers: cascadeConnectHeaders("stream"),
       body: body as unknown as BodyInit,
       signal: req.signal,
     })
@@ -570,6 +656,7 @@ export async function* streamChatEvents(req: {
     }
   }
   let sawEos = false
+  let emittedOutput = false
   let trailerError: { code?: string; message: string } | null = null
   while (true) {
     const { value, done } = await reader.read()
@@ -600,11 +687,29 @@ export async function* streamChatEvents(req: {
         }
         continue
       }
-      yield* decodeChatFrame(payload)
+      for (const ev of decodeChatFrame(payload)) {
+        if (ev.kind === "text" || ev.kind === "reasoning" || ev.kind === "tool_call_start" || ev.kind === "tool_call_args") {
+          emittedOutput = true
+        }
+        yield ev
+      }
     }
   }
   if (trailerError) {
-    trace(`GetChatMessage trailer error code=${trailerError.code ?? ""} message=${trailerError.message.slice(0, 800)} host=${host} model=${req.modelUid}`)
+    const historyBytes = shrinkableHistoryBytes(proto)
+    trace(`GetChatMessage trailer error code=${trailerError.code ?? ""} message=${trailerError.message.slice(0, 800)} host=${host} model=${req.modelUid} protoBytes=${proto.length} framedBytes=${body.length} historyBytes=${historyBytes}`)
+    if (isLargeHistoryOverflow({
+      code: trailerError.code,
+      message: trailerError.message,
+      historyBytes,
+      emittedOutput,
+    })) {
+      trace(`GetChatMessage trailer error mapped to context overflow historyBytes=${historyBytes} protoBytes=${proto.length} framedBytes=${body.length}`)
+      throw devinContextOverflowError(
+        `Cascade rejected the turn (invalid_argument) after ${historyBytes} bytes of history`,
+        `${host}/exa.api_server_pb.ApiServerService/GetChatMessage`,
+      )
+    }
     // Surface quota errors as non-transient so OpenCode shows message instead of retrying as "overloaded"
     const isQuota = trailerError.code === "failed_precondition" && /quota has been exhausted/i.test(trailerError.message)
     if (isQuota) {

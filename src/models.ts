@@ -2,10 +2,20 @@ import { createHash } from "node:crypto"
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 import * as zlib from "node:zlib"
+import { cascadeMintHost, resolveCascadeApiBase } from "./api-base.js"
 import { MODEL_CACHE_FILE, MODEL_CACHE_SCHEMA_VERSION, MODEL_CACHE_TTL_MS } from "./shared.js"
-import { buildMetadata } from "./protocol/metadata.js"
+import {
+  CLI_USER_AGENT,
+  DISPLAY_MODEL_ROUTER,
+  INTERNAL_DISPLAY_SLOTS,
+  buildCliMetadata,
+  buildDiscoveryMetadata,
+  buildWindsurfMetadata,
+  resolveClientIdentity,
+  type ClientIdentity,
+} from "./protocol/metadata.js"
 import { encodeMessage, iterFields } from "./protocol/wire.js"
-import { getCachedUserJwt } from "./auth.js"
+import { getCachedUserAuth } from "./auth.js"
 import { trace } from "./debug.js"
 
 export const DEVIN_VARIANT_PARAMETERS_KEY = "devinVariantParameters"
@@ -34,6 +44,8 @@ export type ModelInfo = {
   maxContextForMaxMode?: number
   supportsMaxMode?: boolean
   maxOutput?: number
+  /** Server-side router (`adaptive` and similar). Chat must call AssignModel first. */
+  requiresAssignModel?: boolean
   variants: ModelVariant[]
   cost?: {
     input: number
@@ -145,10 +157,11 @@ function normalizeModelInfo(value: unknown): ModelInfo | null {
   const supportsVideo = optionalBoolean(value, ["supportsVideo", "supports_video"])
   const supportsDocuments = optionalBoolean(value, ["supportsDocuments", "supports_documents"])
   const supportsMaxMode = optionalBoolean(value, ["supportsMaxMode", "supports_max_mode"])
+  const requiresAssignModel = optionalBoolean(value, ["requiresAssignModel", "requires_assign_model"])
   const maxContext = optionalPositiveNumber(value, ["maxContext", "contextTokenLimit", "context_token_limit"])
   const maxContextForMaxMode = optionalPositiveNumber(value, ["maxContextForMaxMode", "contextTokenLimitForMaxMode", "context_token_limit_for_max_mode"])
   const maxOutput = optionalPositiveNumber(value, ["maxOutput", "max_output_tokens"])
-  if (displayName === null || family === null || supportsThinking === null || supportsAgent === null || supportsImages === null || supportsVideo === null || supportsDocuments === null || supportsMaxMode === null || maxContext === null || maxContextForMaxMode === null || maxOutput === null) return null
+  if (displayName === null || family === null || supportsThinking === null || supportsAgent === null || supportsImages === null || supportsVideo === null || supportsDocuments === null || supportsMaxMode === null || requiresAssignModel === null || maxContext === null || maxContextForMaxMode === null || maxOutput === null) return null
   // cost is optional and persisted from RPC pricing (#32)
   let cost: ModelInfo["cost"] | undefined
   if (Object.hasOwn(value as Record<string, unknown>, "cost")) {
@@ -185,6 +198,7 @@ function normalizeModelInfo(value: unknown): ModelInfo | null {
     ...(maxContextForMaxMode === undefined ? {} : { maxContextForMaxMode }),
     ...(maxOutput === undefined ? {} : { maxOutput }),
     ...(supportsMaxMode === undefined ? {} : { supportsMaxMode }),
+    ...(requiresAssignModel ? { requiresAssignModel: true } : {}),
     ...(cost ? { cost } : {}),
     variants: variants as ModelVariant[],
   }
@@ -313,6 +327,68 @@ export function clearDevinWireIdAliases(): void {
   wireIdAliases.clear()
 }
 
+const assignModelUids = new Set<string>()
+
+export function clearDevinAssignModels(): void {
+  assignModelUids.clear()
+}
+
+export function registerDevinAssignModel(wireId: string): void {
+  const id = wireId.trim()
+  if (id) assignModelUids.add(id)
+}
+
+export function modelRequiresAssignModel(wireId: string | undefined): boolean {
+  if (!wireId) return false
+  return assignModelUids.has(wireId)
+}
+
+export type CatalogDisposition = "chat" | "assign-router" | "subagent" | "internal" | "fusion" | "disabled"
+
+/**
+ * Cascade catalog rules:
+ * - `subagent-default` is a Task wire token, not a picker model.
+ * - Display slots 4 (quick-review) and 6 (internal-default) stay hidden.
+ * - A router flag with harness uids is a composite pairing. Omit it; the
+ *   server rejects the composite uid and the lead is not remapped here.
+ * - A router flag with an empty harness list (`adaptive`) needs AssignModel.
+ */
+export function catalogDisposition(input: {
+  modelUid: string
+  disabled?: boolean
+  displayOption?: number
+  isModelRouter?: boolean
+  harnessUids?: readonly string[]
+  showDisabled?: boolean
+}): CatalogDisposition {
+  if (input.modelUid === "subagent-default") return "subagent"
+  if (input.displayOption !== undefined && INTERNAL_DISPLAY_SLOTS.has(input.displayOption)) return "internal"
+  const harness = (input.harnessUids ?? []).map((uid) => uid.trim()).filter(Boolean)
+  const isRouter = input.displayOption === DISPLAY_MODEL_ROUTER || input.isModelRouter === true
+  if (isRouter && harness.length > 0) return "fusion"
+  if (input.disabled && !input.showDisabled) return "disabled"
+  if (isRouter) return "assign-router"
+  return "chat"
+}
+
+const CLI_DISCOVERY_RPCS = [
+  "exa.api_server_pb.ApiServerService/GetCliModelConfigs",
+  "exa.api_server_pb.ApiServerService/GetCascadeModelConfigs",
+  "exa.seat_management_pb.SeatManagementService/GetUserStatus",
+  "exa.api_server_pb.ApiServerService/GetUserStatus",
+] as const
+
+const DESKTOP_DISCOVERY_RPCS = [
+  "exa.api_server_pb.ApiServerService/GetCascadeModelConfigs",
+  "exa.api_server_pb.ApiServerService/GetCliModelConfigs",
+  "exa.seat_management_pb.SeatManagementService/GetUserStatus",
+  "exa.api_server_pb.ApiServerService/GetUserStatus",
+] as const
+
+export function discoveryRpcOrder(identity: ClientIdentity = resolveClientIdentity()): readonly string[] {
+  return identity === "cli" ? CLI_DISCOVERY_RPCS : DESKTOP_DISCOVERY_RPCS
+}
+
 export function registerDevinWireIdAlias(
   baseId: string,
   params: ModelParameterValue[],
@@ -336,6 +412,7 @@ export function resolveDevinWireModelId(
   // Explicit override kept for back-compat / debugging only — catalog no longer emits it.
   const value = providerOptions?.[DEVIN_WIRE_MODEL_ID_KEY]
   if (typeof value === "string" && value.trim()) return value
+  if (modelRequiresAssignModel(fallback)) return fallback
   let picked = params
   if (
     picked === undefined &&
@@ -432,23 +509,35 @@ export function isCacheFreshWithTtl(cache: ModelCache, ttlMs = MODEL_CACHE_TTL_M
 // ── Fetch + cache orchestration ──
 
 async function fetchDevinModels(accessToken: string, opts: { baseURL?: string; signal?: AbortSignal } = {}): Promise<ModelInfo[]> {
-  const base = (opts.baseURL ?? process.env.DEVIN_API_BASE_URL ?? process.env.WINDSURF_API_BASE_URL ?? "https://server.codeium.com").replace(/\/$/, "")
-  let userJwt: string | undefined
-  try { userJwt = await getCachedUserJwt(accessToken, base, opts.signal) } catch {}
-  const metadata = buildMetadata({ apiKey: accessToken, userJwt, sessionId: crypto.randomUUID(), requestId: BigInt(Date.now()), triggerId: crypto.randomUUID() })
-  const req = encodeMessage(1, metadata)
+  const mintHost = cascadeMintHost(opts.baseURL)
+  let customApiServerUrl: string | undefined
+  try {
+    const auth = await getCachedUserAuth(accessToken, mintHost, opts.signal)
+    customApiServerUrl = auth.customApiServerUrl
+  } catch {}
+  const base = resolveCascadeApiBase({ configured: opts.baseURL, customApiServerUrl })
+  const identity = resolveClientIdentity()
+  const sessionId = crypto.randomUUID()
+  const requestId = BigInt(Date.now())
+  const triggerId = crypto.randomUUID()
+  const metaInput = { apiKey: accessToken, sessionId, requestId, triggerId }
+  const cliMeta = encodeMessage(1, buildCliMetadata(metaInput))
+  const discoveryMeta = encodeMessage(1, buildDiscoveryMetadata(metaInput))
+  const desktopMeta = encodeMessage(1, buildWindsurfMetadata(metaInput))
   const headers: Record<string, string> = {
     "Content-Type": "application/proto",
     "Connect-Protocol-Version": "1",
+    Accept: "*/*",
     Authorization: `Bearer ${accessToken}`,
   }
-  const tryFetch = async (path: string): Promise<Uint8Array | null> => {
+  if (identity === "cli") headers["User-Agent"] = CLI_USER_AGENT
+  const tryFetch = async (path: string, body: Uint8Array): Promise<Uint8Array | null> => {
     const url = `${base}/${path}`
     try {
       const res = await fetch(url, {
         method: "POST",
         headers,
-        body: req as unknown as BodyInit,
+        body: body as unknown as BodyInit,
         signal: opts.signal,
       })
       if (!res.ok) {
@@ -470,15 +559,16 @@ async function fetchDevinModels(accessToken: string, opts: { baseURL?: string; s
       return null
     }
   }
-  const candidates: Array<{ path: string; parser: (b: Uint8Array) => ModelInfo[] }> = [
-    { path: "exa.api_server_pb.ApiServerService/GetCascadeModelConfigs", parser: parseCascadeModelConfigs },
-    { path: "exa.api_server_pb.ApiServerService/GetCliModelConfigs", parser: parseCascadeModelConfigs },
-    { path: "exa.seat_management_pb.SeatManagementService/GetUserStatus", parser: parseModelsFromUserStatus },
-    { path: "exa.api_server_pb.ApiServerService/GetUserStatus", parser: parseModelsFromUserStatus },
-  ]
+  const candidates: Array<{ path: string; parser: (b: Uint8Array) => ModelInfo[] }> = discoveryRpcOrder(identity).map((path) => ({
+    path,
+    parser: path.includes("GetUserStatus") ? parseModelsFromUserStatus : parseCascadeModelConfigs,
+  }))
   let best: ModelInfo[] = []
   for (const c of candidates) {
-    const buf = await tryFetch(c.path)
+    const body = identity === "cli"
+      ? (c.path.includes("GetCliModelConfigs") ? discoveryMeta : cliMeta)
+      : desktopMeta
+    const buf = await tryFetch(c.path, body)
     if (!buf || buf.length < 10) continue
     const models = c.parser(buf)
     trace(`${c.path} -> ${models.length} models`)
@@ -586,7 +676,7 @@ function f32FromBytes(bytes: Uint8Array): number {
   return view.getFloat32(0, true)
 }
 
-function parseCascadeModelConfigs(buf: Uint8Array): ModelInfo[] {
+export function parseCascadeModelConfigs(buf: Uint8Array, skipped?: Set<string>): ModelInfo[] {
   const models: ModelInfo[] = []
   const seen = new Set<string>()
   const showDisabled = shouldShowDisabledForDebug()
@@ -602,6 +692,9 @@ function parseCascadeModelConfigs(buf: Uint8Array): ModelInfo[] {
     let maxContext: number | undefined
     let maxOutput: number | undefined
     let family: string | undefined
+    let displayOption: number | undefined
+    let isModelRouter = false
+    const harnessUids: string[] = []
     let modelInfoBytes: Uint8Array | undefined
     let familyBytes: Uint8Array | undefined
     const pricingEntries: Array<{ name: string; price: number }> = []
@@ -638,6 +731,13 @@ function parseCascadeModelConfigs(buf: Uint8Array): ModelInfo[] {
         } else if (mf.num === 13 && mf.wire === 0) {
           const n = Number(mf.value)
           if (Number.isSafeInteger(n) && n > 0) maxOutput = n
+        } else if (mf.num === 20 && mf.wire === 2 && mf.value instanceof Uint8Array) {
+          const harness = new TextDecoder().decode(mf.value).trim()
+          if (harness) harnessUids.push(harness)
+        } else if (mf.num === 22 && mf.wire === 0) {
+          displayOption = Number(mf.value)
+        } else if (mf.num === 25 && mf.wire === 0) {
+          isModelRouter = mf.value === 1n || mf.value === 1
         } else if (mf.num === 8 && mf.wire === 2 && mf.value instanceof Uint8Array) {
           // model_name as fallback family hint
           if (!family) {
@@ -666,16 +766,31 @@ function parseCascadeModelConfigs(buf: Uint8Array): ModelInfo[] {
         }
       }
     }
-    // Wire token for Task/subagent — not a chat picker model.
-    if (modelUid === "subagent-default") {
+    if (!modelUid || seen.has(modelUid)) continue
+    const disposition = catalogDisposition({
+      modelUid,
+      disabled,
+      displayOption,
+      isModelRouter,
+      harnessUids,
+      showDisabled,
+    })
+    if (disposition === "subagent" || disposition === "disabled" || disposition === "internal" || disposition === "fusion") {
+      skipped?.add(modelUid)
+    }
+    if (disposition === "subagent") {
       trace("skip wire uid subagent-default (not a chat model)")
       continue
     }
-    if (modelUid && !seen.has(modelUid)) {
-      if (disabled && !showDisabled) {
-        trace(`skip disabled ${modelUid}`)
-        continue
-      }
+    if (disposition === "disabled") {
+      trace(`skip disabled ${modelUid}`)
+      continue
+    }
+    if (disposition === "internal" || disposition === "fusion") {
+      trace(`skip ${modelUid} (${disposition})`)
+      continue
+    }
+    {
       seen.add(modelUid)
       // Infer supportsThinking from label/uid or ModelFeatures.#15
       const supportsThinking = supportsThinkingFromFeatures
@@ -687,6 +802,7 @@ function parseCascadeModelConfigs(buf: Uint8Array): ModelInfo[] {
       if (supportsVideo !== undefined) info.supportsVideo = supportsVideo
       if (supportsDocuments !== undefined) info.supportsDocuments = supportsDocuments
       if (supportsThinking) info.supportsThinking = true
+      if (disposition === "assign-router") info.requiresAssignModel = true
       // All Devin models support tool calling via Cascade
       info.supportsAgent = true
       if (maxContext !== undefined) info.maxContext = maxContext
@@ -723,8 +839,10 @@ function parseModelsFromUserStatus(buf: Uint8Array): ModelInfo[] {
       if (f.wire === 2 && f.value instanceof Uint8Array) {
         const bytes = f.value
         // Use cascade parser on any blob that looks like repeated field 1
-        const sub = parseCascadeModelConfigs(bytes)
+        const skipped = new Set<string>()
+        const sub = parseCascadeModelConfigs(bytes, skipped)
         for (const m of sub) if (!seen.has(m.id)) { seen.add(m.id); models.push(m) }
+        for (const id of skipped) seen.add(id)
         // Fallback brute for GetUserStatus nested encoding — respect disabled
         for (const inner of iterFields(bytes)) {
           if (inner.num === 22 && inner.wire === 2 && inner.value instanceof Uint8Array) {

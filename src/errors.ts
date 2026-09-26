@@ -1,3 +1,5 @@
+import { APICallError } from "@ai-sdk/provider"
+
 export class DevinProviderError extends Error {
   public code?: string
   public transient?: boolean
@@ -61,6 +63,23 @@ export function devinHttpError(prefix: string, status: number): DevinProviderErr
   if (status === 401 || status === 403) return new DevinAuthError(`${prefix} HTTP ${status}`)
   const transient = status === 429 || status >= 500
   return new DevinProviderError(`${prefix} HTTP ${status}`, { code: String(status), transient, replaySafe: true })
+}
+
+/**
+ * Non-retryable overflow. The message matches OpenCode's context-overflow
+ * detector (`prompt is too long`) and the body uses `context_length_exceeded`
+ * so compaction can run instead of a generic retry.
+ */
+export function devinContextOverflowError(detail: string, url: string): APICallError {
+  const message = `prompt is too long: ${detail}`
+  return new APICallError({
+    message,
+    url,
+    requestBodyValues: {},
+    statusCode: 400,
+    isRetryable: false,
+    responseBody: JSON.stringify({ error: { code: "context_length_exceeded", message } }),
+  })
 }
 
 export function errorCode(cause: unknown): string | undefined {

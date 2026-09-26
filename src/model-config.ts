@@ -1,6 +1,8 @@
 import {
   DEVIN_VARIANT_PARAMETERS_KEY,
+  clearDevinAssignModels,
   clearDevinWireIdAliases,
+  registerDevinAssignModel,
   registerDevinWireIdAlias,
   type ModelInfo,
   type ModelVariant,
@@ -566,11 +568,17 @@ function groupSupportsReasoning(
 export function modelsToConfig(models: ModelInfo[]): Record<string, any> {
   // Fresh alias table — opaque PRIVATE_* wire ids are registered per variant below.
   clearDevinWireIdAliases()
+  clearDevinAssignModels()
+
+  // AssignModel routers are dispatchers, not effort ladders. Keep each one as
+  // its own base id even when the label would otherwise peel into a family.
+  const routers = models.filter((model) => model.requiresAssignModel)
+  const catalogModels = models.filter((model) => !model.requiresAssignModel)
 
   // Group flat Devin models by baseId stripping effort/speed suffixes
   const groups = new Map<string, Array<{ model: ModelInfo; variantName: string | null }>>()
   const baseDisplayByGroup = new Map<string, string>()
-  for (const m of models) {
+  for (const m of catalogModels) {
     const { baseId, variantName } = splitDevinVariant(m)
     const entry = groups.get(baseId)
     if (entry) {
@@ -591,7 +599,7 @@ export function modelsToConfig(models: ModelInfo[]): Record<string, any> {
     }
   }
 
-  const ambiguous = thinkingSuffixBaseNames(models)
+  const ambiguous = thinkingSuffixBaseNames(catalogModels)
   const out: Record<string, any> = {}
 
   for (const [baseId, members] of groups) {
@@ -712,6 +720,13 @@ export function modelsToConfig(models: ModelInfo[]): Record<string, any> {
       }
     }
     out[baseId] = applyDevinModelCost(baseId, baseConfig)
+  }
+
+  for (const router of routers) {
+    registerDevinAssignModel(router.id)
+    const config = modelInfoToConfig(router, { thinkingSuffix: false })
+    if (router.displayName?.trim()) config.name = router.displayName.trim()
+    out[router.id] = applyDevinModelCost(router.id, config)
   }
 
   return out

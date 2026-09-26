@@ -2,10 +2,11 @@ import * as http from "node:http"
 import * as crypto from "node:crypto"
 import { withAbortDeadline } from "./deadline.js"
 import { WINDSURF_API_HOST, DEVIN_API_HOST, DEVIN_WEBSITE_HOST, WINDSURF_REGISTER_HOST, WINDSURF_OAUTH_CLIENT_ID, WINDSURF_WEBSITE_HOST } from "./shared.js"
-import { buildMetadata } from "./protocol/metadata.js"
+import { PUBLIC_CASCADE_ORIGIN } from "./api-base.js"
+import { buildMetadata, cascadeConnectHeaders } from "./protocol/metadata.js"
 import { encodeMessage, iterFields } from "./protocol/wire.js"
 
-const API_BASE = `https://${WINDSURF_API_HOST}`
+const API_BASE = PUBLIC_CASCADE_ORIGIN
 const DEVIN_AUTH_BASE = `https://${DEVIN_API_HOST}`
 const DEVIN_APP_BASE = `https://${DEVIN_WEBSITE_HOST}`
 const AUTH_TIMEOUT_MS = 15_000
@@ -46,7 +47,24 @@ export function decodeJwtExpiryMs(jwt: string): number | null {
 
 export type TokenPair = { accessToken: string; refreshToken?: string }
 
-export async function mintUserJwt(apiKey: string, host = API_BASE, signal?: AbortSignal): Promise<{ jwt: string; expiresAt: number }> {
+export type UserJwtMint = { jwt: string; expiresAt: number; customApiServerUrl?: string }
+
+const JWT_RE = /^eyJ[A-Za-z0-9_-]{10,}={0,2}\.[A-Za-z0-9_-]+={0,2}\.[A-Za-z0-9_-]+={0,2}$/
+
+/** `GetUserJwtResponse`: field 1 user JWT, field 2 enterprise Cascade base. */
+export function parseGetUserJwtBody(buf: Uint8Array): { jwt: string | null; customApiServerUrl?: string } {
+  let jwt: string | null = null
+  let customApiServerUrl: string | undefined
+  for (const f of iterFields(buf)) {
+    if (f.wire !== 2 || !(f.value instanceof Uint8Array)) continue
+    const s = new TextDecoder().decode(f.value).trim()
+    if (f.num === 1 && JWT_RE.test(s)) jwt = s
+    else if (f.num === 2 && s) customApiServerUrl = s
+  }
+  return { jwt, ...(customApiServerUrl ? { customApiServerUrl } : {}) }
+}
+
+export async function mintUserJwt(apiKey: string, host = API_BASE, signal?: AbortSignal): Promise<UserJwtMint> {
   return withAbortDeadline(AUTH_TIMEOUT_MS, () => new AuthExchangeError("GetUserJwt timed out"), async (sig) => {
     const combined = signal ? (AbortSignal as any).any ? (AbortSignal as any).any([signal, sig]) : signal : sig
     const metadata = buildMetadata({ apiKey, sessionId: crypto.randomUUID(), requestId: BigInt(Date.now()), triggerId: crypto.randomUUID() })
@@ -55,7 +73,7 @@ export async function mintUserJwt(apiKey: string, host = API_BASE, signal?: Abor
     try {
       res = await fetch(`${host.replace(/\/$/, "")}/exa.auth_pb.AuthService/GetUserJwt`, {
         method: "POST",
-        headers: { "Content-Type": "application/proto", "Connect-Protocol-Version": "1" },
+        headers: cascadeConnectHeaders("unary"),
         body: req as unknown as BodyInit,
         signal: combined,
       })
@@ -64,43 +82,51 @@ export async function mintUserJwt(apiKey: string, host = API_BASE, signal?: Abor
     }
     const buf = new Uint8Array(await res.arrayBuffer())
     if (!res.ok) throw new AuthExchangeError(`GetUserJwt HTTP ${res.status}: ${new TextDecoder().decode(buf).slice(0, 400)}`)
-    let jwt: string | null = null
-    for (const f of iterFields(buf)) {
-      if (f.num === 1 && f.wire === 2 && f.value instanceof Uint8Array) {
-        const s = new TextDecoder().decode(f.value)
-        if (/^eyJ[A-Za-z0-9_-]{10,}={0,2}\.[A-Za-z0-9_-]+={0,2}\.[A-Za-z0-9_-]+={0,2}$/.test(s)) { jwt = s; break }
-      }
-    }
-    if (!jwt) throw new AuthExchangeError(`GetUserJwt missing jwt (${buf.length} bytes)`)
+    const parsed = parseGetUserJwtBody(buf)
+    if (!parsed.jwt) throw new AuthExchangeError(`GetUserJwt missing jwt (${buf.length} bytes)`)
     let exp = Math.floor(Date.now() / 1000) + 600
     try {
-      const payload = decodeJwtPayload(jwt)
+      const payload = decodeJwtPayload(parsed.jwt)
       if (payload && typeof payload.exp === "number") exp = payload.exp
     } catch {}
-    return { jwt, expiresAt: exp }
+    return { jwt: parsed.jwt, expiresAt: exp, ...(parsed.customApiServerUrl ? { customApiServerUrl: parsed.customApiServerUrl } : {}) }
   })
 }
 
-let cachedJwt: { jwt: string; expiresAt: number; apiKey: string; host: string } | null = null
-let inflight: Map<string, Promise<{ jwt: string; expiresAt: number }>> = new Map()
+let cachedJwt: UserJwtMint & { apiKey: string; host: string } | null = null
+let inflight: Map<string, Promise<UserJwtMint>> = new Map()
 let epoch = 0
 
 function flightKey(apiKey: string, host: string) { return `${host}\x1f${apiKey}` }
 
-export async function getCachedUserJwt(apiKey: string, host = API_BASE, signal?: AbortSignal): Promise<string> {
+function cacheHit(apiKey: string, host: string): UserJwtMint | null {
   const now = Math.floor(Date.now() / 1000)
-  if (cachedJwt && cachedJwt.apiKey === apiKey && cachedJwt.host === host && cachedJwt.expiresAt > now + 60) return cachedJwt.jwt
+  if (!cachedJwt || cachedJwt.apiKey !== apiKey || cachedJwt.host !== host || cachedJwt.expiresAt <= now + 60) return null
+  return {
+    jwt: cachedJwt.jwt,
+    expiresAt: cachedJwt.expiresAt,
+    ...(cachedJwt.customApiServerUrl ? { customApiServerUrl: cachedJwt.customApiServerUrl } : {}),
+  }
+}
+
+export async function getCachedUserAuth(apiKey: string, host = API_BASE, signal?: AbortSignal): Promise<UserJwtMint> {
+  const hit = cacheHit(apiKey, host)
+  if (hit) return hit
   const key = flightKey(apiKey, host)
   const existing = inflight.get(key)
-  if (existing) return (await existing).jwt
+  if (existing) return existing
   const p = mintUserJwt(apiKey, host, signal)
   inflight.set(key, p)
   const epochAtStart = epoch
   try {
     const minted = await p
     if (epoch === epochAtStart) cachedJwt = { ...minted, apiKey, host }
-    return minted.jwt
+    return minted
   } finally { inflight.delete(key) }
+}
+
+export async function getCachedUserJwt(apiKey: string, host = API_BASE, signal?: AbortSignal): Promise<string> {
+  return (await getCachedUserAuth(apiKey, host, signal)).jwt
 }
 
 export function clearCachedUserJwt(): void {

@@ -2,8 +2,12 @@ import type { LanguageModelV3, LanguageModelV3CallOptions, LanguageModelV3Stream
 import * as crypto from "node:crypto"
 import path from "node:path"
 import type { CreateDevinOptions } from "./index.js"
-import { getCachedUserJwt, resolveBearerToken } from "./auth.js"
+import { getCachedUserAuth, resolveBearerToken } from "./auth.js"
+import { cascadeMintHost, resolveCascadeApiBase } from "./api-base.js"
 import { devinApiBaseURL } from "./plugin-core.js"
+import { assignCascadeModel } from "./protocol/assign.js"
+import { isGeminiWireUid } from "./protocol/gemini-schema.js"
+import { currentSeatSnapshot, fetchSeatSnapshot } from "./protocol/seat-status.js"
 import { isDebugEnabled, trace } from "./debug.js"
 import type { ChatHistoryItem, ContentPart, ToolDef } from "./protocol/chat.js"
 import { canonicalizeToolDefs, toolsInFixedOrder, streamChatEvents } from "./protocol/chat.js"
@@ -24,7 +28,7 @@ import {
   hostShellTool,
   remapEmittedToolCall,
 } from "./protocol/host-dialect.js"
-import { extractDevinVariantParameters, lookupDevinWireIdAlias, resolveDevinWireModelId } from "./models.js"
+import { extractDevinVariantParameters, lookupDevinWireIdAlias, modelRequiresAssignModel, resolveDevinWireModelId } from "./models.js"
 import {
   resolveDevinModelSupportsDocuments,
   resolveDevinModelSupportsImages,
@@ -173,6 +177,17 @@ function hostToolDialectLine(tools: ToolDef[]): string {
     `host tool dialect: filePathKey=${filePathKey} shellTool=${shellTool} ` +
     `tools=[${tools.map((t) => t.name).join(",")}]`
   )
+}
+
+function lastUserTurnText(messages: readonly ChatHistoryItem[]): string | undefined {
+  const last = [...messages].reverse().find((message) => message.role === "user")
+  if (!last) return undefined
+  if (typeof last.content === "string") return last.content
+  const text = last.content
+    .filter((part): part is Extract<ContentPart, { type: "text" }> => part.type === "text")
+    .map((part) => part.text)
+    .join("\n")
+  return text || undefined
 }
 
 function extractSystemPrompt(prompt: LanguageModelV3CallOptions["prompt"]): string | undefined {
@@ -524,8 +539,11 @@ async function doStreamImpl(
   callOptions: LanguageModelV3CallOptions,
 ): Promise<LanguageModelV3StreamResult> {
   const apiKey = await resolveBearerToken({ accessToken: options.accessToken, apiKey: options.apiKey, baseUrl: options.apiBaseURL ?? devinApiBaseURL() })
-  const host = options.apiBaseURL ?? devinApiBaseURL()
-  const userJwt = await getCachedUserJwt(apiKey, host, callOptions.abortSignal ?? undefined)
+  const configuredBase = options.apiBaseURL ?? devinApiBaseURL()
+  const mintHost = cascadeMintHost(configuredBase)
+  const minted = await getCachedUserAuth(apiKey, mintHost, callOptions.abortSignal ?? undefined)
+  const userJwt = minted.jwt
+  const host = resolveCascadeApiBase({ configured: configuredBase, customApiServerUrl: minted.customApiServerUrl })
 
   // Resolve the wire model id and variant parameters from OpenCode options:
   // OpenCode merges model/variant into providerOptions.devin — we must not
@@ -689,6 +707,23 @@ async function doStreamImpl(
       `cascadeHash=${diagnosticFingerprint(cascadeId)} cacheKeyHash=${diagnosticFingerprint(promptCacheKey)}`,
   )
 
+  let chatModelUid = wireModelId
+  let assignmentJwt: string | undefined
+  if (modelRequiresAssignModel(wireModelId) || modelRequiresAssignModel(modelId)) {
+    const assignment = await assignCascadeModel({
+      apiKey,
+      host,
+      modelRouterUid: wireModelId,
+      cascadeId,
+      userText: lastUserTurnText(messages),
+      signal: callOptions.abortSignal ?? undefined,
+    })
+    chatModelUid = assignment.modelUid
+    assignmentJwt = assignment.assignmentJwt
+    trace(`assign model: router=${wireModelId} assigned=${chatModelUid} cascadeHash=${diagnosticFingerprint(cascadeId)}`)
+  }
+  void fetchSeatSnapshot(apiKey, host, callOptions.abortSignal ?? undefined)
+
   const stream = new ReadableStream<LanguageModelV3StreamPart>({
     async start(controller) {
       controller.enqueue({ type: "stream-start", warnings: [] } as LanguageModelV3StreamPart)
@@ -703,6 +738,10 @@ async function doStreamImpl(
       let rawFinish: string | undefined
       const counters: DevinUsageCounters = { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0 }
       let hasUsage = false
+      let actualModelUid: string | undefined
+      let creditCost: number | undefined
+      let committedCreditCost: number | undefined
+      let committedAcuCost: number | undefined
 
       const toFinishReason = (unified: string, raw?: string): any => ({ unified, raw })
 
@@ -772,7 +811,7 @@ async function doStreamImpl(
         for await (const ev of streamChatEvents({
           apiKey,
           apiServerUrl: host,
-          modelUid: wireModelId,
+          modelUid: chatModelUid,
           messages,
           tools: tools.length ? tools : undefined,
           cascadeId,
@@ -780,6 +819,8 @@ async function doStreamImpl(
           promptCacheKey,
           signal: callOptions.abortSignal,
           userJwt,
+          modelAssignmentJwt: assignmentJwt,
+          normalizeGeminiTools: isGeminiWireUid(chatModelUid) || isGeminiWireUid(wireModelId),
         })) {
           if (callOptions.abortSignal?.aborted) break
           if (ev.kind === "text") {
@@ -815,6 +856,13 @@ async function doStreamImpl(
             } else {
               trace(`devin usage: input=${counters.inputTokens} output=${counters.outputTokens} cacheRead=${counters.cacheRead} cacheWrite=${counters.cacheWrite}`)
             }
+          } else if (ev.kind === "credits") {
+            if (typeof ev.creditCost === "number") creditCost = ev.creditCost
+            if (typeof ev.committedCreditCost === "number") committedCreditCost = ev.committedCreditCost
+            if (typeof ev.committedAcuCost === "number") committedAcuCost = ev.committedAcuCost
+          } else if (ev.kind === "actual_model") {
+            actualModelUid = ev.uid
+            trace(`assign model: router=${wireModelId} assigned=${chatModelUid} actual=${ev.uid}`)
           }
         }
       } catch (e) {
@@ -973,11 +1021,26 @@ async function doStreamImpl(
       } else if (debugEnabled) {
         trace(`devin final usage: hasUsage=${hasUsage} input=${counters.inputTokens} output=${counters.outputTokens} cacheRead=${counters.cacheRead}`)
       }
+      if (debugEnabled && (creditCost !== undefined || committedCreditCost !== undefined || committedAcuCost !== undefined || actualModelUid)) {
+        trace(`turn credits: cost=${creditCost ?? "-"} committed=${committedCreditCost ?? "-"} acu=${committedAcuCost ?? "-"} actual=${actualModelUid ?? "-"}`)
+      }
+      const seat = currentSeatSnapshot(host)
       controller.enqueue({
         type: "finish",
         finishReason: toFinishReason(finishUnified, rawFinish),
         usage: finalUsage,
-        providerMetadata: { devin: { modelId, usageCounters: hasUsage ? counters : undefined, rawCounters, cacheDiagnosis: hasUsage && rawCounters ? `raw input=${rawCounters.inputTokens} output=${rawCounters.outputTokens} cacheRead=${rawCounters.cacheRead} cacheWrite=${rawCounters.cacheWrite}${rawCounters.cacheRead > rawCounters.inputTokens ? " (cacheRead > input — warm cache snapshot)" : ""}` : undefined } },
+        providerMetadata: { devin: {
+          modelId,
+          ...(assignmentJwt ? { assignedModelUid: chatModelUid } : {}),
+          ...(actualModelUid ? { actualModelUid } : {}),
+          ...(creditCost !== undefined ? { creditCost } : {}),
+          ...(committedCreditCost !== undefined ? { committedCreditCost } : {}),
+          ...(committedAcuCost !== undefined ? { committedAcuCost } : {}),
+          ...(seat ? { seat } : {}),
+          usageCounters: hasUsage ? counters : undefined,
+          rawCounters,
+          cacheDiagnosis: hasUsage && rawCounters ? `raw input=${rawCounters.inputTokens} output=${rawCounters.outputTokens} cacheRead=${rawCounters.cacheRead} cacheWrite=${rawCounters.cacheWrite}${rawCounters.cacheRead > rawCounters.inputTokens ? " (cacheRead > input — warm cache snapshot)" : ""}` : undefined,
+        } },
       } as unknown as LanguageModelV3StreamPart)
       controller.close()
     },

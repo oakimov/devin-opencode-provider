@@ -22,8 +22,8 @@ This directory contains development notes and lessons learned during development
 - Emit usage only once at turn end to avoid double-counting
 
 ### Model discovery
-- Use GetCascadeModelConfigs as primary source
-- Fall back to GetUserStatus if cascade fails
+- CLI identity calls `GetCliModelConfigs` first, then `GetCascadeModelConfigs`, then `GetUserStatus`. Desktop identity (`DEVIN_CLIENT_IDENTITY=windsurf`) keeps Cascade first. See “CLI Cascade wire” below.
+- Fall back to `GetUserStatus` if the model-config RPCs fail
 - Parse ClientModelConfig fields: #22 model_uid, #1 label, #4 disabled
 - Cache schema version bumps when catalog shape changes (`devin-models.json`); TTL ~1 day under `~/.cache/opencode/`
 - Plan filtering hides most models unless `DEVIN_PROVIDER_SHOW_DISABLED=1` — Pro may only show `swe-1-6-slow` without it
@@ -110,6 +110,18 @@ so stale non-empty cache can still be served. Delete
 - The 2.0 daemon's cwd is not the project. Resolve `x-opencode-directory`
   (URI-encoded) first, then `ctx.session.get()` flat `info.directory`, then
   legacy `info.location.directory`, then static option/cwd.
+
+### CLI Cascade wire (2026-09-26)
+- Default Metadata is released Devin CLI: `ideName=devin-cli`, `ideType=chisel`, versions `3000.6.2`, real `os` (`darwin` / `windows` / `linux`). `DEVIN_CLIENT_IDENTITY=windsurf` is the Desktop rollback (`1.48.2` / `3.6.27` / `mac`). Do not flip identity without that flag.
+- `GetCliModelConfigs` uses a different identity: `chisel` / `0.0.0-dev`, and must advertise display slots 3, 4, 6, 7, 8. Slots 4 and 6 are hidden after the response. That call is first only for the CLI identity.
+- `Metadata.userJwt` is field 21. Chat sets it. `AssignModel`, discovery, and seat status leave it empty. `Metadata.apiKey` always carries a single `devin-session-token$` prefix.
+- `GetUserJwt` field 2 `customApiServerUrl` is the Cascade host unless `DEVIN_API_BASE_URL` or `WINDSURF_API_BASE_URL` is set. Mint the JWT against the explicit host, then switch.
+- `AssignModel` and the following `GetChatMessage` must share `cascadeId`. The router prompt is the current user text only, with an empty `messageId`. On failure, do not send the router uid as `chatModelUid`. Chat field 21 is the assigned uid; field 26 is `modelAssignmentJwt`.
+- A router flag with harness uids is a composite pairing, not an AssignModel target. Omit it. A router flag with an empty harness list (`adaptive`) is `requiresAssignModel` and must stay a standalone base — not an effort variant. `subagent-default` stays hidden.
+- Cache schema 5: `requiresAssignModel` is new. Old `devin-models.json` files are stale until refresh.
+- Gemini / `MODEL_GOOGLE_GEMINI_*` tool schemas must drop type unions like `["number","null"]` before encode.
+- Early Connect trailer `invalid_argument` + “internal error”, before any output, with shrinkable history ≥ 512 KiB, is a non-retryable `prompt is too long` / `context_length_exceeded` error. Log it on the existing `GetChatMessage trailer error` line, including `protoBytes`, `framedBytes`, and `historyBytes`.
+- Seat status and turn credits are `providerMetadata.devin` plus debug lines `seat status:` and `turn credits:`. Do not block chat on status failure, and do not fold credits into the `cache diagnosis:` line.
 
 ### Path grounding is keyed on exact host tool names (2026-09-26)
 - Only canonical `read`, `grep`, `glob`, `bash`, `shell` results are
