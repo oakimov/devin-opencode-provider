@@ -94,3 +94,26 @@ so stale non-empty cache can still be served. Delete
 - Shrink drops omitted names, because every advertised tool is
   host-executable. Compaction still sends `tools=[]` so the summarizer
   cannot call tools.
+
+### OpenCode 2 MCP catalog placement (2026-09-26)
+- Do not write MCP server `codemode` to put tools on the direct catalog: that
+  field also decides whether OpenCode appends `?codemode=false` so a remote
+  server returns individual tools. Placement is the tool's `options.codemode`,
+  set to `false` via `ctx.tool.transform` for namespaces whose server did not
+  explicitly set `codemode: true`.
+- Host `<mcp_instructions>` still say "use `execute`" from server config, so
+  provider guidance must prefer the direct name when the tool is listed.
+- A first prompt sent before MCP servers finish connecting sees no MCP tools;
+  the next turn does. Do not delay startup or the first request for MCP.
+
+### OpenCode 2 workspace directory (2026-09-26)
+- The 2.0 daemon's cwd is not the project. Resolve `x-opencode-directory`
+  (URI-encoded) first, then `ctx.session.get()` flat `info.directory`, then
+  legacy `info.location.directory`, then static option/cwd.
+
+### Path grounding is keyed on exact host tool names (2026-09-26)
+- Only canonical `read`, `grep`, `glob`, `bash`, `shell` results are
+  grounded. Name-segment matching rewrote MCP output (`db_execute`,
+  `github_read_file`) and OpenCode 2 Code Mode `execute`, whose result is a
+  returned string or JSON (`packages/core/src/codemode/tool.ts` formatResult):
+  `feature/x`, `owner/repo`, `image/png` became invented workspace paths.

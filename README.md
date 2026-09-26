@@ -217,6 +217,8 @@ bun install          # install dependencies
 bun run build        # compile TypeScript → dist/
 bun run typecheck    # type-check without emit
 bun test             # run unit tests
+bun run test:watch   # unit tests in watch mode
+bun run check:pricing  # fixture coverage for known model ids (stub-safe today)
 ```
 
 ## Architecture

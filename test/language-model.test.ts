@@ -323,6 +323,29 @@ describe("buildDevinOpenCodeGuidance", () => {
     expect(guids(["read"])).not.toContain("`question`")
   })
 
+  it("calls the advertised list direct tools, not an exhaustive catalog", () => {
+    const g = guids(["read"])
+    expect(g).toContain("OpenCode exposes these direct tools for this turn: `read`.")
+    expect(g).toContain("Call only tools in that direct list")
+    expect(g).not.toContain("exactly these executable tools")
+  })
+
+  it("explains Code Mode execute and prefers direct MCP names", () => {
+    const withShell = guids(["execute", "shell"])
+    expect(withShell).toContain("it is not a shell")
+    expect(withShell).toContain("call OpenCode `shell`")
+    expect(withShell).toContain("Do not pass `command` to `execute`")
+    expect(withShell).toContain("Call tools named in the direct list by their own names, even when a server instruction says to reach them through `execute`")
+    expect(withShell).toContain("Use `execute` only for tools that appear in the host Code Mode catalog")
+    expect(withShell).toContain("call `execute` with `{ code }`")
+
+    expect(guids(["execute", "bash"])).toContain("call OpenCode `bash`")
+    const executeOnly = guids(["execute"])
+    expect(executeOnly).toContain("host Code Mode catalog")
+    expect(executeOnly).not.toContain("call OpenCode `shell`")
+    expect(guids(["shell"])).not.toContain("host Code Mode catalog")
+  })
+
   it("always includes footer about emitting actual tool calls", () => {
     expect(guids(["read"])).toContain("Emit the actual tool call and wait for its result")
   })
@@ -373,7 +396,7 @@ describe("tool description injection via extractTools (smoke)", () => {
   it("guidance is stable for canonical file-tool catalog", () => {
     const g = guids(["read", "edit", "write", "grep", "glob", "bash", "question"])
     expect(g.split("\n").length).toBeGreaterThan(5)
-    expect(g).toContain("OpenCode exposes exactly these executable tools")
+    expect(g).toContain("OpenCode exposes these direct tools")
   })
 
   it("names the advertised shell tool in write/search guidance", () => {

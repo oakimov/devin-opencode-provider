@@ -208,6 +208,40 @@ describe("groundToolResultText", () => {
     expect(groundToolResultText("bash", "src/a.ts", undefined)).toBe("src/a.ts")
     expect(groundToolResultText("edit", "src/a.ts", root)).toBe("src/a.ts")
   })
+
+  it("leaves OpenCode 2 Code Mode execute results byte-for-byte", () => {
+    // Code Mode returns a string verbatim or pretty-printed JSON; neither is
+    // shell stdout (opencode2 packages/core/src/codemode/tool.ts formatResult).
+    const output = [
+      "acme/widgets",
+      "feature/mcp-direct",
+      "image/png",
+      "2026/09/26",
+      "src/a.ts:12",
+      "",
+      "Logs:",
+      "owner/repo",
+    ].join("\n")
+    expect(groundToolResultText("execute", output, root, { code: "return x" })).toBe(output)
+  })
+
+  it("matches host tools by exact name, never by an MCP name segment", () => {
+    const shellLike = "feature/mcp-direct"
+    for (const name of ["db_execute", "github_execute_workflow", "k8s_shell", "remote-bash", "Bash"]) {
+      expect(groundToolResultText(name, shellLike, root)).toBe(shellLike)
+    }
+    const searchLike = ["Found 1 matches", "src/a.ts:", "  Line 1: x"].join("\n")
+    for (const name of ["code_grep", "fs-glob"]) {
+      expect(groundToolResultText(name, searchLike, root)).toBe(searchLike)
+    }
+    const listing = ["Read directory src, entries 1-1", "a.ts"].join("\n")
+    for (const name of ["github_read_file", "opencode-read"]) {
+      expect(groundToolResultText(name, listing, root)).toBe(listing)
+    }
+    expect(groundToolResultText("read", listing, root)).toBe(
+      [`Read directory ${root}/src, entries 1-1`, `${root}/src/a.ts`].join("\n"),
+    )
+  })
 })
 
 describe("extractHistory path grounding", () => {

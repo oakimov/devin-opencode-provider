@@ -236,6 +236,18 @@ export type ToolDraft = {
   /** Host ToolEditor.get — used to skip registering tools the host already owns. */
   get?(id: string): (ToolDefinition & { readonly id?: string }) | undefined
   list?(): readonly (ToolDefinition & { readonly id: string })[]
+  /** Host ToolEditor.update — missing ids are ignored. */
+  update?(
+    id: string,
+    update: (tool: {
+      options?: {
+        namespace?: string
+        permission?: string
+        codemode?: boolean
+        pinned?: boolean
+      }
+    }) => void,
+  ): void
 }
 
 export type ToolHookBaseFields = {
@@ -303,10 +315,14 @@ export type SessionHooks = {
   readonly title: SessionTitle
 }
 
-/** Only the `location.directory` field we actually read. */
+/**
+ * Only the directory fields we read. OpenCode 2.0 stable exposes a flat
+ * `directory`; earlier shapes nest it under `location.directory`.
+ */
 export type SessionInfo = {
   readonly id: string
-  readonly location: { readonly directory: string }
+  readonly directory?: string
+  readonly location?: { readonly directory?: string }
 }
 
 export type SessionDomain = {
@@ -382,6 +398,25 @@ export type WebSearchDomain = {
   readonly reload: () => Promise<void>
 }
 
+// ── MCP ──
+
+/**
+ * MCP config reader this plugin uses. Server `codemode` is observed and not
+ * written: writing it also changes the remote raw-tool URL. The host
+ * `MCPEditor` is a superset.
+ */
+export type McpServerConfig = {
+  readonly codemode?: boolean
+}
+
+export type McpEditor = {
+  list(): readonly (readonly [string, McpServerConfig])[]
+}
+
+export type McpDomain = {
+  readonly transform: Transform<McpEditor>
+}
+
 export type PluginLocation = {
   readonly directory: string
 }
@@ -396,6 +431,7 @@ export type PluginContext = {
   readonly location?: PluginLocation
   readonly shell?: ShellDomain
   readonly websearch?: WebSearchDomain
+  readonly mcp?: McpDomain
 }
 
 export type Cleanup = () => Promise<void> | void

@@ -1,6 +1,6 @@
 {
   "name": "devin-opencode-provider",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Use Devin/Windsurf subscription models from OpenCode via Windsurf's Connect-RPC Cascade protocol",
   "type": "module",
   "license": "MIT",
@@ -65,7 +65,9 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
-    "test": "bun test"
+    "test": "bun test",
+    "test:watch": "bun test --watch",
+    "check:pricing": "bun run scripts/check-devin-pricing-coverage.ts"
   },
   "dependencies": {
     "@ai-sdk/provider": "3.0.16"

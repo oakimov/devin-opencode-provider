@@ -38,7 +38,7 @@ import {
 } from "./image-input.js"
 import { DEVIN_COMPACTION_OPTION } from "./shared.js"
 import { isCompactionSession } from "./compaction-marker.js"
-import { getSessionDirectory } from "./session-directory.js"
+import { resolveSessionWorkspaceRoot } from "./session-directory.js"
 import { feedThinkTags, flushThinkTags, newThinkTagState, splitThinkDocument } from "./think-tags.js"
 
 /** OpenCode session id header, if present — used for cascade/prompt_cache_key affinity. */
@@ -461,10 +461,21 @@ export function buildDevinOpenCodeGuidance(tools: ToolDef[], workspaceRoot: stri
     const listed = ["todowrite", "todoread"].filter((n) => names.has(n)).map((n) => `\`${n}\``).join(" / ")
     instructions.push(`- For a session task list, use OpenCode ${listed}.`)
   }
+  if (names.has("execute")) {
+    const osShell = names.has("shell") ? "`shell`" : names.has("bash") ? "`bash`" : undefined
+    instructions.push(
+      osShell
+        ? `- OpenCode \`execute\` is Code Mode JavaScript (\`code\`); it is not a shell. For OS commands, call OpenCode ${osShell}. Do not pass \`command\` to \`execute\`.`
+        : "- OpenCode `execute` is Code Mode JavaScript (`code`); it is not a shell. Do not pass `command` to `execute`.",
+    )
+    instructions.push(
+      "- Call tools named in the direct list by their own names, even when a server instruction says to reach them through `execute`. Use `execute` only for tools that appear in the host Code Mode catalog and are absent from that list. Use the exact paths and signatures from that catalog or its `search` function, and call `execute` with `{ code }`.",
+    )
+  }
 
-  const header = `OpenCode exposes exactly these executable tools for this turn: ${[...names].map(n => `\`${n}\``).join(", ")}.`
+  const header = `OpenCode exposes these direct tools for this turn: ${[...names].map(n => `\`${n}\``).join(", ")}.`
   const root = `Workspace root: ${JSON.stringify(workspaceRoot)}. Resolve workspace paths against exactly this root; never invent an absolute prefix, and verify uncertain paths with \`glob\`/\`read\` before using them.`
-  const footer = "Call only tools in that exact list for ordinary host execution. Emit the actual tool call and wait for its result; never merely claim or summarize that a tool was used."
+  const footer = "Call only tools in that direct list for ordinary host execution. Emit the actual tool call and wait for its result; never merely claim or summarize that a tool was used."
 
   return [
     header,
@@ -613,9 +624,14 @@ async function doStreamImpl(
   const isCompaction = compactionOption === true || (
     compactionOption === undefined && isCompactionSession(sessionKey)
   )
-  const workspaceRoot = path.resolve(
-    getSessionDirectory(sessionKey) ?? options.workspaceRoot ?? (callOptions as any).workspaceRoot ?? process.cwd(),
-  )
+  // v1 supplies `options.workspaceRoot` per project. The OpenCode 2.0 daemon
+  // serves many projects, so prefer the per-request `x-opencode-directory`
+  // header, then the session mark from `session.hook("context")`.
+  const workspaceRoot = resolveSessionWorkspaceRoot({
+    sessionKey,
+    headers: callOptions.headers,
+    workspaceRoot: options.workspaceRoot ?? (callOptions as any).workspaceRoot,
+  })
   let messages = extractHistory(callOptions.prompt, workspaceRoot)
   if (attachmentExtraction?.attachments.length) {
     messages = injectAttachmentsOntoLastUser(

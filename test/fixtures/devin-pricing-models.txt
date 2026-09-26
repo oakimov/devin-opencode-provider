@@ -1,0 +1,10 @@
+# Known Devin / OpenCode base model ids that must resolve to pricing
+# (or be listed in DEVIN_UNPRICED_MODEL_IDS) once real rates are published.
+#
+# Pricing is currently stubbed (`DEVIN_MODEL_COSTS` is empty), so this fixture
+# stays empty on purpose. When populating `src/pricing-data.ts`, add each
+# covered base id here (one per line) and re-run `bun run check:pricing`.
+#
+# Example:
+# claude-opus-5
+# swe-1-7

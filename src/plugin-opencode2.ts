@@ -20,6 +20,7 @@ import {
 } from "./shell-timeout.js"
 import { applyDevinProviderInventory, DEVIN_INTEGRATION_ID } from "./opencode2/catalog.js"
 import { applyDevinIntegration, resolveDevinAccessToken } from "./opencode2/integration.js"
+import { exposeDirectMcpTools, rememberDirectMcpNamespaces } from "./opencode2/mcp-direct.js"
 import { registerTodoTools } from "./opencode2/todo-tools.js"
 import { clearSessionTodos, clearAllSessionTodos } from "./todo-store.js"
 import { clearCompactionSessions, markCompactionSession } from "./compaction-marker.js"
@@ -30,6 +31,7 @@ import type { CreateDevinOptions } from "./index.js"
 import type {
   Cleanup,
   ConnectionInfo,
+  McpEditor,
   PluginContext,
   Plugin2,
 } from "./opencode2/types.js"
@@ -337,8 +339,8 @@ const plugin: Plugin2 & { server: typeof DevinPlugin } = {
           ...(token ? { accessToken: token } : {}),
           // Static fallback only. This hook fires once per model/package, not
           // per session, and 2.0 runs one daemon across many projects — the
-          // real per-request directory comes from the session.context hook
-          // below via `getSessionDirectory`, which `language-model.ts` prefers.
+          // real per-request directory comes from `x-opencode-directory` and
+          // the session.context hook below via `getSessionDirectory`.
           workspaceRoot,
           cacheDir,
           ...event.options,
@@ -375,6 +377,19 @@ const plugin: Plugin2 & { server: typeof DevinPlugin } = {
       )
     }
 
+    // Keep the reader for the latest MCP rebuild, not a snapshot taken halfway
+    // through its transforms. OpenCode's editor.list() reads that rebuild's
+    // backing map, including servers added/replaced by later transforms.
+    // Read it only when the tool registry rebuilds after MCP reconciliation.
+    let mcpEditor: McpEditor | undefined
+    if (ctx.mcp) {
+      await track(
+        ctx.mcp.transform((editor) => {
+          mcpEditor = editor
+        }),
+      )
+    }
+
     await track(
       ctx.tool.transform((draft) => {
         // OpenCode 2 dropped host todowrite/todoread. Off by default
@@ -384,6 +399,12 @@ const plugin: Plugin2 & { server: typeof DevinPlugin } = {
         // Do not advertise a stub image-save: public ToolContext cannot ask
         // for write permission, and Devin has no generate-image protocol.
         registerTodoTools(draft)
+        // MCP tools default into Code Mode. Move every server that did not
+        // explicitly opt in onto the direct catalog so Devin can call them by
+        // name. See `opencode2/mcp-direct.ts`.
+        const namespaces = new Set<string>()
+        rememberDirectMcpNamespaces(namespaces, mcpEditor?.list() ?? [])
+        exposeDirectMcpTools(draft, namespaces)
       }),
     )
 
@@ -438,7 +459,8 @@ const plugin: Plugin2 & { server: typeof DevinPlugin } = {
     const rememberSessionDirectory = async (sessionID: string) => {
       try {
         const info = await ctx.session.get({ sessionID })
-        markSessionDirectory(sessionID, info.location?.directory)
+        // Prefer the flat 2.0 stable field over the nested legacy one.
+        markSessionDirectory(sessionID, info.directory ?? info.location?.directory)
       } catch {
         // Best effort — falls back to the static workspaceRoot above.
       }

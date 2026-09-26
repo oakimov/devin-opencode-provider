@@ -431,27 +431,30 @@ function rewriteShellPathLine(line: string, root: string): string {
   return line
 }
 
-/** True for the file-read tool only — matched as a whole segment so tools like
- * `thread`, `todoread`, or `spreadsheet` never get their output unwrapped. */
+/**
+ * Host tool names are matched exactly. MCP tools such as `github_read_file`
+ * or `db_execute`, and OpenCode 2 Code Mode `execute` (JavaScript whose
+ * result is a returned string or JSON), carry arbitrary data: repo slugs,
+ * branch names, and MIME types would otherwise be rewritten into invented
+ * workspace paths.
+ */
 export function isReadToolName(name: string): boolean {
-  if (name === "read" || name === "opencode-read") return true
-  return /(^|[-_:/])read([-_:/]|$)/i.test(name)
+  return name === "read"
 }
 
 function isSearchToolName(name: string): boolean {
-  if (name === "grep" || name === "glob") return true
-  return /(^|[-_:/])(grep|glob)([-_:/]|$)/i.test(name)
+  return name === "grep" || name === "glob"
 }
 
 function isShellToolName(name: string): boolean {
-  if (name === "bash" || name === "shell" || name === "execute") return true
-  return /(^|[-_:/])(bash|shell|execute)([-_:/]|$)/i.test(name)
+  return name === "bash" || name === "shell"
 }
 
 /**
  * Ground relative paths in tool text the model will see again next turn.
  * Grep and glob keep every match preview; only path headers and path-list
- * rows are rewritten. Unrelated tools are left byte-for-byte.
+ * rows are rewritten. Only the canonical `read`, `grep`, `glob`, `bash`, and
+ * `shell` host tools are touched; every other tool is left byte-for-byte.
  */
 export function groundToolResultText(
   toolName: string,

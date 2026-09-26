@@ -208,6 +208,13 @@ export type HostPluginContext = {
     }) => Promise<unknown>
     readonly prompt: (input: { sessionID: string; text: string }) => Promise<unknown>
   }
+  readonly mcp: {
+    readonly transform: HostTransform<{
+      list(): readonly [string, { type: "local" | "remote"; codemode?: boolean }][]
+      update(name: string, update: (config: { type: "local" | "remote"; codemode?: boolean }) => void): void
+    }>
+    readonly reload: () => Promise<void>
+  }
   readonly shell: {
     readonly hook: HostHooks<{
       "create.before": {
@@ -260,6 +267,17 @@ export type HostPluginContext = {
         readonly options?: { readonly codemode?: boolean; readonly namespace?: string; readonly permission?: string }
         readonly execute: (input: unknown, context: HostToolContext) => Promise<unknown>
       }[]
+      update?(
+        id: string,
+        update: (tool: {
+          options?: {
+            namespace?: string
+            permission?: string
+            codemode?: boolean
+            pinned?: boolean
+          }
+        }) => void,
+      ): void
     }>
     readonly reload: () => Promise<void>
     readonly hook: HostHooks<{

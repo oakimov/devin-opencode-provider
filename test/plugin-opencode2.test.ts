@@ -200,6 +200,7 @@ function fakeContext(events: readonly unknown[] = [], subscribe?: () => unknown)
       }),
     },
     websearch: transformDomain("websearch"),
+    mcp: transformDomain("mcp"),
     shell: hookDomain("shell"),
     provider: {
       transform: async (callback: (editor: any) => void) => {
@@ -284,6 +285,143 @@ describe("opencode2 plugin setup", () => {
     expect(event.options?.[DEVIN_COMPACTION_OPTION]).toBe(true)
     expect(isCompactionSession("ses_1")).toBe(true)
     expect(getSessionDirectory("ses_1")).toBe("/proj/ses_1")
+  })
+
+  test("session.context records the directory from the flat OpenCode 2.0 info.directory", async () => {
+    clearSessionDirectories()
+    const { ctx, hooks } = fakeContext()
+    ctx.session.get = async ({ sessionID }: { sessionID: string }) => ({
+      id: sessionID,
+      directory: "/workspace/flat-app",
+      location: { directory: "/workspace/legacy" },
+    })
+    const cleanup = await plugin.setup(ctx)
+    await hooks.get("session.context")!({ sessionID: "ses_flat", agent: "build" })
+    expect(getSessionDirectory("ses_flat")).toBe("/workspace/flat-app")
+    await cleanup()
+  })
+
+  test("puts MCP tools on the direct catalog without editing server config", async () => {
+    const { ctx, transforms } = fakeContext()
+    const cleanup = await plugin.setup(ctx)
+    const servers: Record<string, { type: string; codemode?: boolean }> = {
+      github: { type: "local" },
+      executor: { type: "local", codemode: true },
+    }
+    const tools = [
+      { id: "github_create_pull_request", options: { namespace: "github", codemode: true as boolean | undefined, permission: "github_create_pull_request" } },
+      { id: "executor_run", options: { namespace: "executor", codemode: true as boolean | undefined } },
+      { id: "opencode_session_rename", options: { namespace: "opencode", codemode: true as boolean | undefined } },
+    ]
+    const applyTools = () => {
+      transforms.get("tool")?.({
+        add: () => {},
+        list: () => tools,
+        update: (id: string, update: (tool: (typeof tools)[number]) => void) => {
+          const tool = tools.find((item) => item.id === id)
+          if (tool) update(tool)
+        },
+      })
+    }
+
+    applyTools()
+    expect(tools[0]?.options.codemode).toBe(true)
+
+    transforms.get("mcp")?.({ list: () => Object.entries(servers) })
+    expect(servers.github?.codemode).toBeUndefined()
+    expect(servers.executor?.codemode).toBe(true)
+
+    applyTools()
+    expect(tools[0]?.options).toEqual({
+      namespace: "github",
+      permission: "github_create_pull_request",
+      codemode: false,
+    })
+    expect(tools[1]?.options.codemode).toBe(true)
+    expect(tools[2]?.options.codemode).toBe(true)
+
+    // Discovery reloads rebuild from the host's original registrations, then
+    // replay this transform over newly discovered tools too.
+    tools.push({ id: "github_search", options: { namespace: "github", codemode: true } })
+    applyTools()
+    expect(tools[3]?.options.codemode).toBe(false)
+
+    servers.github!.codemode = true
+    transforms.get("mcp")?.({ list: () => Object.entries(servers) })
+    for (const tool of tools) tool.options.codemode = true
+    applyTools()
+    expect(tools[0]?.options.codemode).toBe(true)
+    expect(tools[3]?.options.codemode).toBe(true)
+
+    delete servers.github
+    transforms.get("mcp")?.({ list: () => Object.entries(servers) })
+    applyTools()
+    expect(tools[0]?.options.codemode).toBe(true)
+    await cleanup()
+  })
+
+  test("MCP placement observes later transforms and the latest rebuild", async () => {
+    const { ctx, transforms } = fakeContext()
+    const cleanup = await plugin.setup(ctx)
+    type Config = { codemode?: boolean }
+    const rebuildMcp = (initial: Record<string, Config>, later: (servers: Map<string, Config>) => void) => {
+      // Like OpenCode State, each rebuild owns a new backing map. list()
+      // reads that map afresh even after this transform has returned.
+      const servers = new Map(Object.entries(initial))
+      transforms.get("mcp")!({ list: () => [...servers] })
+      later(servers)
+      return servers
+    }
+    const placement = (namespaces: string[]) => {
+      // The host's registration transform reconstructs tools on every reload.
+      const tools = namespaces.map(namespace => ({
+        id: `${namespace}_search`,
+        options: { namespace, codemode: true },
+      }))
+      transforms.get("tool")!({
+        add: () => {},
+        list: () => tools,
+        update: (id: string, update: (tool: (typeof tools)[number]) => void) => {
+          update(tools.find(tool => tool.id === id)!)
+        },
+      })
+      return Object.fromEntries(tools.map(tool => [tool.options.namespace, tool.options.codemode]))
+    }
+    try {
+      const old = rebuildMcp({ docs: {}, removed: {}, "my.docs": {} }, servers => {
+        // Replacement (not just mutation), late addition, removal, and a
+        // late explicit opt-in sharing another server's normalized namespace.
+        servers.set("docs", { codemode: true })
+        servers.set("added", {})
+        servers.delete("removed")
+        servers.set("my_docs", { codemode: true })
+      })
+      expect(placement(["docs", "added", "removed", "my_docs"])).toEqual({
+        docs: true, added: false, removed: true, my_docs: true,
+      })
+      expect(old.get("docs")).toEqual({ codemode: true })
+      expect(old.get("added")).toEqual({})
+
+      rebuildMcp({ docs: { codemode: true } }, servers => servers.set("docs", {}))
+      old.set("docs", { codemode: true })
+      expect(placement(["docs", "added", "my_docs"])).toEqual({
+        docs: false, added: true, my_docs: true,
+      })
+
+      rebuildMcp({}, () => {})
+      expect(placement(["docs"])).toEqual({ docs: true })
+    } finally {
+      await cleanup()
+    }
+  })
+
+  test("sets up on a host without the mcp domain", async () => {
+    const { ctx, registered } = fakeContext()
+    delete ctx.mcp
+    const cleanup = await plugin.setup(ctx)
+    expect(registered).not.toContain("mcp.transform")
+    expect(registered).toContain("tool.transform")
+    await cleanup()
   })
 
   test("accepts id or callID for shell sanitization", async () => {
