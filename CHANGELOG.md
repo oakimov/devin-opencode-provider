@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.8 - 2026-10-29
+
+### Changed
 
 - Keep the classic plugin entrypoint limited to its plugin factory so OpenCode 1.x does not invoke model and tool-loader helpers during startup.
 
