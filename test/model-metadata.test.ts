@@ -1,4 +1,11 @@
-import { describe, it, expect } from "bun:test"
+import { describe, it, expect, beforeEach, afterEach } from "bun:test"
+import { modelsToConfig } from "../src/model-config.js"
+import {
+  clearDevinLiveCatalog,
+  clearDevinWireIdAliases,
+  lookupDevinLiveModel,
+  type ModelInfo,
+} from "../src/models.js"
 import { getDocumentedDevinModelContext, resolveDevinModelSupportsImages } from "../src/model-metadata.js"
 
 describe("getDocumentedDevinModelContext", () => {
@@ -35,5 +42,45 @@ describe("resolveDevinModelSupportsImages", () => {
 
   it("returns boolean", () => {
     expect(typeof resolveDevinModelSupportsImages("x", undefined)).toBe("boolean")
+  })
+})
+
+describe("live catalog attachment caps (issue #3)", () => {
+  beforeEach(() => {
+    clearDevinWireIdAliases()
+    clearDevinLiveCatalog()
+  })
+  afterEach(() => {
+    clearDevinWireIdAliases()
+    clearDevinLiveCatalog()
+  })
+
+  function makeModel(overrides: Partial<ModelInfo> & { id: string }): ModelInfo {
+    return {
+      displayName: overrides.displayName ?? overrides.id,
+      supportsAgent: true,
+      maxContext: 200_000,
+      maxOutput: 32_000,
+      variants: [],
+      ...overrides,
+    }
+  }
+
+  it("modelsToConfig remembers supportsImages for stream lookup", () => {
+    modelsToConfig([makeModel({ id: "swe-2-max", supportsImages: true })])
+    const live = lookupDevinLiveModel("swe-2-max")
+    expect(live?.supportsImages).toBe(true)
+    expect(resolveDevinModelSupportsImages("swe-2-max", live?.supportsImages)).toBe(true)
+  })
+
+  it("fail-closed without a remembered catalog", () => {
+    expect(lookupDevinLiveModel("swe-2-max")).toBeUndefined()
+    expect(resolveDevinModelSupportsImages("swe-2-max", undefined)).toBe(false)
+  })
+
+  it("empty catalog clears remembered models", () => {
+    modelsToConfig([makeModel({ id: "swe-2-max", supportsImages: true })])
+    modelsToConfig([])
+    expect(lookupDevinLiveModel("swe-2-max")).toBeUndefined()
   })
 })

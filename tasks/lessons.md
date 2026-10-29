@@ -4,6 +4,9 @@ This directory contains development notes and lessons learned during development
 
 ## Lessons learned
 
+### Classic plugin module exports
+- OpenCode 1.x invokes every runtime export of a classic plugin file as a plugin factory. Keep model mapping and tool-loading helpers in utility modules, and test the complete entrypoint export surface.
+
 ### Debug log lifecycle
 - Mid-run module reload must **append** to `DEVIN_PROVIDER_DEBUG_FILE`
   (`reinit=append`), not truncate — otherwise earlier lines disappear while

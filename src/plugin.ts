@@ -1,5 +1,3 @@
-import path from "node:path"
-import { pathToFileURL } from "node:url"
 import type { Hooks, PluginInput, AuthOAuthResult, Config, ToolDefinition } from "@opencode-ai/plugin"
 import type { Auth } from "@opencode-ai/sdk"
 import {
@@ -13,8 +11,7 @@ import {
 import { devinApiBaseURL } from "./plugin-core.js"
 import { readCache, discoverModels } from "./models.js"
 import { modelsToConfig } from "./model-config.js"
-export { modelInfoToConfig, modelsToConfig, thinkingSuffixBaseNames } from "./model-config.js"
-import { opencodeGlobalCacheDir, opencodeGlobalConfigDirs } from "./context/paths.js"
+import { opencodeGlobalCacheDir } from "./context/paths.js"
 import { readStoredAuth, type StoredAuth } from "./context/auth-store.js"
 import { getCachedUserJwt, createLoopbackServer, buildDevinLoginUrl, generatePkceParams, generatePkceChallenge, pollForDevinTokens, isExpiringSoon, decodeJwtExpiryMs } from "./auth.js"
 import { trace } from "./debug.js"
@@ -27,39 +24,9 @@ import {
   sanitizeRegisteredDevinShellOutput,
   setDevinShellPath,
 } from "./shell-timeout.js"
-import { createOpenCodeWebSearchTool, classicToolFactoryFromModule, openCodeWebSearchTool } from "./web-search-tool.js"
+import { loadClassicTools } from "./web-search-tool.js"
 
 const MODULE_URL = new URL("./index.js", import.meta.url).href
-
-export async function loadClassicTools(options: {
-  importModule?: (specifier: string) => Promise<unknown>
-  configDirs?: string[]
-} = {}): Promise<{ webSearch: Record<string, unknown> }> {
-  const configDir = options.configDirs?.[0] ?? opencodeGlobalConfigDirs()[0]
-  const candidates = [
-    ...(configDir
-      ? [path.join(configDir, "node_modules", "@opencode-ai", "plugin", "dist", "index.js")]
-      : []),
-    "@opencode-ai/plugin",
-  ]
-  const importModule = options.importModule ?? ((specifier: string) => import(specifier))
-  for (const candidate of candidates) {
-    try {
-      const specifier = path.win32.isAbsolute(candidate) && !path.isAbsolute(candidate)
-        ? new URL(`file:///${candidate.replaceAll("\\", "/")}`).href
-        : path.isAbsolute(candidate)
-          ? pathToFileURL(candidate).href
-          : candidate
-      const module = await importModule(specifier)
-      const factory = classicToolFactoryFromModule(module)
-      if (!factory) continue
-      return { webSearch: createOpenCodeWebSearchTool(factory) }
-    } catch {
-      // Try the next host-owned/normal resolution location.
-    }
-  }
-  return { webSearch: openCodeWebSearchTool }
-}
 
 export async function DevinPlugin(input: PluginInput): Promise<Hooks> {
   const cacheDir = opencodeGlobalCacheDir()

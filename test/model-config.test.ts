@@ -1,6 +1,12 @@
 import { describe, it, expect, beforeEach } from "bun:test"
 import { modelsToConfig, thinkingSuffixBaseNames, modelInfoToConfig } from "../src/model-config.js"
-import { clearDevinWireIdAliases, registerDevinWireIdAlias, resolveDevinWireModelId, type ModelInfo } from "../src/models.js"
+import {
+  clearDevinLiveCatalog,
+  clearDevinWireIdAliases,
+  registerDevinWireIdAlias,
+  resolveDevinWireModelId,
+  type ModelInfo,
+} from "../src/models.js"
 
 function makeModel(overrides: Partial<ModelInfo> & { id: string }): ModelInfo {
   return {
@@ -92,6 +98,7 @@ describe("modelsToConfig grouping", () => {
     // Plan-filtered catalogs hide most uids. Live discovery tests must see them.
     process.env.DEVIN_PROVIDER_SHOW_DISABLED = "1"
     clearDevinWireIdAliases()
+    clearDevinLiveCatalog()
   })
 
   it("groups flat ids into one base with parameter-only variants", () => {

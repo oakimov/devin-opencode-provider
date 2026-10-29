@@ -7,6 +7,7 @@ import {
   isCacheFresh,
   cacheFilePath,
   readCache,
+  clearDevinLiveCatalog,
   clearDevinWireIdAliases,
   registerDevinWireIdAlias,
   resolveDevinWireModelId,
@@ -31,6 +32,7 @@ async function tmpDir() {
 afterEach(async () => {
   await Promise.all(tmpDirs.splice(0).map(d => fs.rm(d, { recursive: true, force: true })))
   clearDevinWireIdAliases()
+  clearDevinLiveCatalog()
 })
 
 describe("normalizeModelCache", () => {

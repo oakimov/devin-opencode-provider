@@ -2,8 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from "bun:test"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { DevinPlugin, loadClassicTools } from "../src/plugin.js"
-import { openCodeWebSearchTool } from "../src/web-search-tool.js"
+import { DevinPlugin } from "../src/plugin.js"
+import { loadClassicTools, openCodeWebSearchTool } from "../src/web-search-tool.js"
 import { DEVIN_COMPACTION_OPTION, DEVIN_HOST_AGENT_OPTION } from "../src/shared.js"
 import { DEVIN_TIMEOUT_BACKGROUND, registerDevinShellCall, resetDevinShellCalls } from "../src/shell-timeout.js"
 import type { ModelInfo } from "../src/models.js"
@@ -19,6 +19,16 @@ function fakeClient(authGet: () => Promise<any>) {
 }
 
 describe("DevinPlugin config hook", () => {
+  it("exports only the plugin from the classic entrypoint", async () => {
+    // OpenCode 1.x invokes every classic module export as a plugin factory.
+    const module = await import("../src/plugin.js")
+    expect(Object.keys(module)).toEqual(["DevinPlugin"])
+    for (const factory of Object.values(module)) {
+      const hooks = await factory({ directory: "/tmp", client: fakeClient(async () => undefined) } as any)
+      expect(hooks.auth?.provider).toBe("devin")
+    }
+  })
+
   let tmpCache: string
   let origXdgCache: string | undefined
   let origXdgData: string | undefined

@@ -1,6 +1,5 @@
 import type { LanguageModelV3, LanguageModelV3CallOptions, LanguageModelV3StreamResult, LanguageModelV3GenerateResult, LanguageModelV3StreamPart, LanguageModelV3Usage } from "@ai-sdk/provider"
 import * as crypto from "node:crypto"
-import path from "node:path"
 import type { CreateDevinOptions } from "./index.js"
 import { getCachedUserAuth, resolveBearerToken } from "./auth.js"
 import { cascadeMintHost, resolveCascadeApiBase } from "./api-base.js"
@@ -28,7 +27,13 @@ import {
   hostShellTool,
   remapEmittedToolCall,
 } from "./protocol/host-dialect.js"
-import { extractDevinVariantParameters, lookupDevinWireIdAlias, modelRequiresAssignModel, resolveDevinWireModelId } from "./models.js"
+import {
+  extractDevinVariantParameters,
+  lookupDevinLiveModel,
+  lookupDevinWireIdAlias,
+  modelRequiresAssignModel,
+  resolveDevinWireModelId,
+} from "./models.js"
 import {
   resolveDevinModelSupportsDocuments,
   resolveDevinModelSupportsImages,
@@ -603,13 +608,16 @@ async function doStreamImpl(
     trace(`devin variant: opencodeId=${modelId} wireId=${wireModelId} picked=${picked ? JSON.stringify(picked) : "none"}`)
   }
 
-  // Attachment support (images + video/document from Devin 3.9.19 ModelFeatures)
+  // Attachment support (images + video/document from Devin 3.9.19 ModelFeatures).
+  // Prefer live catalog flags remembered by modelsToConfig — static
+  // DEVIN_MODEL_CAPABILITIES is empty and must not veto advertised models (#3).
   const lastUserRaw = [...callOptions.prompt].reverse().find((m) => (m as any).role === "user") as unknown as
     | Record<string, unknown>
     | undefined
-  const supportsImages = resolveDevinModelSupportsImages(wireModelId, undefined)
-  const supportsVideo = resolveDevinModelSupportsVideo(wireModelId, undefined)
-  const supportsDocuments = resolveDevinModelSupportsDocuments(wireModelId, undefined)
+  const liveModel = lookupDevinLiveModel(wireModelId) ?? lookupDevinLiveModel(modelId)
+  const supportsImages = resolveDevinModelSupportsImages(wireModelId, liveModel?.supportsImages)
+  const supportsVideo = resolveDevinModelSupportsVideo(wireModelId, liveModel?.supportsVideo)
+  const supportsDocuments = resolveDevinModelSupportsDocuments(wireModelId, liveModel?.supportsDocuments)
   const attachCaps = { supportsImages, supportsVideo, supportsDocuments }
   if (lastUserRaw && hasDevinUserFileAttachments(lastUserRaw)) {
     assertDevinUserAttachmentSupport(lastUserRaw, attachCaps, wireModelId)

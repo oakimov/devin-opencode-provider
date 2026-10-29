@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Keep the classic plugin entrypoint limited to its plugin factory so OpenCode 1.x does not invoke model and tool-loader helpers during startup.
+
+### Fixed
+
+- Image, video, and document attachment checks use live catalog capabilities instead of always rejecting when static capability data is empty ([#3](https://github.com/oakimov/devin-opencode-provider/issues/3)).
+
 ### CLI wire parity
 
 - Default Cascade identity is the released Devin CLI (`devin-cli` / `chisel` `3000.6.2`). `DEVIN_CLIENT_IDENTITY=windsurf` keeps the Desktop metadata.
