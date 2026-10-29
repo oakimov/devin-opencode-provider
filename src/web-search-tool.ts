@@ -1,3 +1,6 @@
+import path from "node:path"
+import { pathToFileURL } from "node:url"
+import { opencodeGlobalConfigDirs } from "./context/paths.js"
 import { executeOpenCodeWebSearch } from "./web-tools.js"
 
 type ZodLike = {
@@ -104,4 +107,34 @@ export function createOpenCodeWebSearchToolFromPlugin(pluginModule: unknown): Re
   const factory = classicToolFactoryFromModule(pluginModule)
   if (!factory) throw new Error("OpenCode plugin module did not provide tool.schema")
   return createOpenCodeWebSearchTool(factory)
+}
+
+export async function loadClassicTools(options: {
+  importModule?: (specifier: string) => Promise<unknown>
+  configDirs?: string[]
+} = {}): Promise<{ webSearch: Record<string, unknown> }> {
+  const configDir = options.configDirs?.[0] ?? opencodeGlobalConfigDirs()[0]
+  const candidates = [
+    ...(configDir
+      ? [path.join(configDir, "node_modules", "@opencode-ai", "plugin", "dist", "index.js")]
+      : []),
+    "@opencode-ai/plugin",
+  ]
+  const importModule = options.importModule ?? ((specifier: string) => import(specifier))
+  for (const candidate of candidates) {
+    try {
+      const specifier = path.win32.isAbsolute(candidate) && !path.isAbsolute(candidate)
+        ? new URL(`file:///${candidate.replaceAll("\\", "/")}`).href
+        : path.isAbsolute(candidate)
+          ? pathToFileURL(candidate).href
+          : candidate
+      const module = await importModule(specifier)
+      const factory = classicToolFactoryFromModule(module)
+      if (!factory) continue
+      return { webSearch: createOpenCodeWebSearchTool(factory) }
+    } catch {
+      // Try the next host-owned/normal resolution location.
+    }
+  }
+  return { webSearch: openCodeWebSearchTool }
 }

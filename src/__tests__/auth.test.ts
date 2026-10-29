@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from "bun:test"
-import { decodeJwtPayload, isExpiringSoon, decodeJwtExpiryMs, generatePkceParams, generatePkceChallenge, buildDevinLoginUrl, exchangeDevinCode, createLoopbackServer } from "../auth.js"
+import { describe, it, expect, afterEach } from "bun:test"
+import { decodeJwtPayload, isExpiringSoon, decodeJwtExpiryMs, generatePkceParams, generatePkceChallenge, buildDevinLoginUrl, createLoopbackServer } from "../auth.js"
 
 describe("Auth", () => {
   describe("JWT handling", () => {

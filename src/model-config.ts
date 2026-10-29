@@ -1,9 +1,11 @@
 import {
   DEVIN_VARIANT_PARAMETERS_KEY,
   clearDevinAssignModels,
+  clearDevinLiveCatalog,
   clearDevinWireIdAliases,
   registerDevinAssignModel,
   registerDevinWireIdAlias,
+  rememberDevinLiveCatalog,
   type ModelInfo,
   type ModelVariant,
 } from "./models.js"
@@ -569,6 +571,9 @@ export function modelsToConfig(models: ModelInfo[]): Record<string, any> {
   // Fresh alias table — opaque PRIVATE_* wire ids are registered per variant below.
   clearDevinWireIdAliases()
   clearDevinAssignModels()
+  // Stream attachment checks read live caps from this snapshot (issue #3).
+  if (models.length) rememberDevinLiveCatalog(models)
+  else clearDevinLiveCatalog()
 
   // AssignModel routers are dispatchers, not effort ladders. Keep each one as
   // its own base id even when the label would otherwise peel into a family.

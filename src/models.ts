@@ -327,6 +327,27 @@ export function clearDevinWireIdAliases(): void {
   wireIdAliases.clear()
 }
 
+/**
+ * Last catalog passed to `modelsToConfig`. Stream attachment checks look up
+ * live `supportsImages` / video / documents here — static pricing-data caps
+ * stay empty and are only a last-resort fallback.
+ */
+let liveCatalogModels: readonly ModelInfo[] = []
+
+export function rememberDevinLiveCatalog(models: readonly ModelInfo[]): void {
+  liveCatalogModels = models
+}
+
+export function lookupDevinLiveModel(id: string): ModelInfo | undefined {
+  const needle = id.trim()
+  if (!needle) return undefined
+  return liveCatalogModels.find((m) => m.id === needle)
+}
+
+export function clearDevinLiveCatalog(): void {
+  liveCatalogModels = []
+}
+
 const assignModelUids = new Set<string>()
 
 export function clearDevinAssignModels(): void {
